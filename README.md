@@ -17,7 +17,7 @@ For Claude accounts you legitimately hold. No Anthropic binaries are redistribut
 Requirements: macOS, and the Xcode Command Line Tools (`xcode-select --install`).
 
 ```bash
-git clone https://github.com/YOURUSER/claudes.git  # TODO: real URL
+git clone https://github.com/youjonathan/claudes.git
 cd claudes
 ./install.sh
 ```
