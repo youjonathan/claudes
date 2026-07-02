@@ -1,6 +1,13 @@
 #!/bin/bash
 set -euo pipefail
-SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# resolve symlinks (install.sh links us onto PATH) so ../lib is found from the real repo
+SRC="${BASH_SOURCE[0]}"
+while [ -L "$SRC" ]; do
+  DIR="$(cd "$(dirname "$SRC")" && pwd)"
+  SRC="$(readlink "$SRC")"
+  [ "${SRC#/}" = "$SRC" ] && SRC="$DIR/$SRC"
+done
+SELF="$(cd "$(dirname "$SRC")" && pwd)"
 CLAUDES_LIB="$(cd "$SELF/../lib" && pwd)"; export CLAUDES_LIB
 source "$CLAUDES_LIB/common.sh"; source "$CLAUDES_LIB/config.sh"; source "$CLAUDES_LIB/instance.sh"
 
