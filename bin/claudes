@@ -1,0 +1,108 @@
+#!/bin/bash
+set -euo pipefail
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CLAUDES_LIB="$(cd "$SELF/../lib" && pwd)"; export CLAUDES_LIB
+source "$CLAUDES_LIB/common.sh"; source "$CLAUDES_LIB/config.sh"; source "$CLAUDES_LIB/instance.sh"
+
+usage() { cat <<EOF
+claudes — run multiple Claude Desktop accounts side by side (macOS)
+
+  claudes add <LETTER> <COLOR> [PROFILE]   create/replace a colored instance
+  claudes list                             show configured instances + status
+  claudes rebuild [--all | <LETTER>]       rebuild after a Claude update
+  claudes remove <LETTER> [--purge]        delete instance (keeps profile unless --purge)
+  claudes rainbow                          create R,O,Y,G,B,I,V instances
+  claudes doctor                           check environment
+
+Colors: red orange yellow green teal blue indigo violet purple pink, or 0-255.
+EOF
+}
+
+cmd_add() {
+  local suffix="${1:?usage: claudes add <LETTER> <COLOR> [PROFILE]}" color="${2:-blue}"
+  valid_suffix "$suffix" || exit 1
+  local prof="${3:-Claude-Acct-${suffix}}" hue
+  valid_profile "$prof" || exit 1
+  hue="$(color_to_hue "$color")" || { echo "ERROR: unknown color '$color'"; exit 1; }
+  build_instance "$suffix" "$hue" "$prof"
+  config_set "$suffix" "$color" "$prof"
+}
+
+cmd_list() {
+  printf '%-8s %-8s %-24s %-8s %s\n' LETTER COLOR PROFILE STATUS VERSION
+  _row() {
+    local st="stopped" ver
+    pgrep -f "/Applications/Claude $1\.app/Contents/MacOS/Claude-bin" >/dev/null && st="running"
+    ver="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "/Applications/Claude $1.app/Contents/Info.plist" 2>/dev/null || echo "-")"
+    printf '%-8s %-8s %-24s %-8s %s\n' "$1" "$2" "$3" "$st" "$ver"
+  }
+  config_each _row
+}
+
+cmd_rebuild() {
+  local ver; ver="$(main_version)"
+  [ -n "$ver" ] || { echo "ERROR: $CLAUDES_APP_SRC missing/unreadable — cannot rebuild"; exit 1; }
+  echo "== rebuilding from main Claude v$ver =="
+  local target="${1:---all}" failed=0
+  _rb() {
+    if [ "$target" != "--all" ] && [ "$target" != "$1" ]; then return; fi
+    local hue; hue="$(color_to_hue "$2")" || { echo "SKIP $1: bad color $2"; failed=1; return; }
+    # subshell wrapper: build_instance's own `set -e` only fires reliably when it
+    # isn't itself the direct test of `if`/`!` (bash suppresses inherited errexit
+    # there) — running it in a subshell lets its internal set -e work, while the
+    # subshell's own exit code is what `if !` correctly tests.
+    if ! ( build_instance "$1" "$hue" "$3" ); then echo "FAILED: Claude $1"; failed=1; fi
+  }
+  config_each _rb
+  [ "$failed" = 0 ] || { echo "== one or more instances FAILED =="; exit 1; }
+  echo "== all instances rebuilt on v$ver =="
+}
+
+cmd_remove() {
+  local suffix="${1:?usage: claudes remove <LETTER> [--purge]}"
+  valid_suffix "$suffix" || exit 1
+  local prof; prof="$(config_list | awk -v s="$suffix" 'tolower($1)==tolower(s){print $3}')"
+  remove_instance "$suffix"
+  config_remove "$suffix"
+  if [ "${2:-}" = "--purge" ] && [ -n "$prof" ]; then
+    rm -rf "$HOME/Library/Application Support/$prof"; echo "purged profile: $prof"
+  else
+    [ -n "$prof" ] && echo "kept profile: $prof (use --purge to delete)"
+  fi
+  return 0
+}
+
+cmd_rainbow() {
+  local c; for c in red orange yellow green blue indigo violet; do
+    local L; L="$(printf '%s' "$c" | cut -c1 | tr '[:lower:]' '[:upper:]')"
+    cmd_add "$L" "$c" "Claude-Acct-$L"
+  done
+}
+
+cmd_doctor() {
+  echo "main Claude: $([ -d "$CLAUDES_APP_SRC" ] && main_version || echo MISSING)"
+  for t in codesign swift iconutil sips; do
+    printf '  %-9s %s\n' "$t" "$(command -v "$t" >/dev/null && echo ok || echo MISSING)"
+  done
+  echo "config: $CLAUDES_CONFIG"; cmd_list
+}
+
+# easter egg (undocumented)
+cmd_egg() {
+  local target="/usr/local/bin"; [ -w "$target" ] || target="$HOME/.local/bin"
+  mkdir -p "$target"
+  ln -sf "$SELF/claudes" "$target/claudesterbation"   # $SELF is already the bin/ dir
+  echo "shh. linked: $target/claudesterbation"
+}
+
+case "${1:-}" in
+  add) shift; cmd_add "$@";;
+  list) shift; cmd_list "$@";;
+  rebuild) shift; cmd_rebuild "$@";;
+  remove) shift; cmd_remove "$@";;
+  rainbow) shift; cmd_rainbow "$@";;
+  doctor) shift; cmd_doctor "$@";;
+  egg) shift; cmd_egg "$@";;
+  ''|-h|--help|help) usage;;
+  *) echo "unknown command: $1"; usage; exit 1;;
+esac
