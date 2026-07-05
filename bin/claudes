@@ -69,7 +69,7 @@ cmd_remove() {
   local suffix="${1:?usage: claudes remove <LETTER> [--purge]}"
   valid_suffix "$suffix" || exit 1
   local prof; prof="$(config_list | awk -v s="$suffix" 'tolower($1)==tolower(s){print $3}')"
-  remove_instance "$suffix"
+  remove_instance "$suffix" "$prof"
   config_remove "$suffix"
   if [ "${2:-}" = "--purge" ] && [ -n "$prof" ]; then
     rm -rf "$HOME/Library/Application Support/$prof"; echo "purged profile: $prof"
