@@ -10,7 +10,7 @@ If you have a work Claude account and a personal one, macOS only lets you run on
 
 ## Disclaimer
 
-For Claude accounts you legitimately hold. No Anthropic binaries are redistributed — the tool operates only on your own local install by copying and ad-hoc re-signing it. It does not share accounts or bypass usage limits.
+For Claude accounts you legitimately hold. No Anthropic binaries are redistributed — the tool operates only on your own local install by creating small launcher apps that point at it; Claude.app itself is never copied or modified. It does not share accounts or bypass usage limits.
 
 ## Install
 
@@ -29,7 +29,6 @@ cd claudes
 ```
 claudes add <LETTER> <COLOR> [PROFILE]   create/replace a colored instance
 claudes list                             show configured instances + status
-claudes rebuild [--all | <LETTER>]       rebuild after a Claude update
 claudes remove <LETTER> [--purge]        delete instance (keeps profile unless --purge)
 claudes rainbow                          create R,O,Y,G,B,I,V instances
 claudes doctor                           check environment
@@ -43,9 +42,6 @@ claudes add W red Claude-Acct-Work
 
 # See what's configured, and whether each instance is currently running
 claudes list
-
-# Rebuild every instance (e.g. after Claude Desktop auto-updates)
-claudes rebuild --all
 
 # Remove an instance, keeping its profile data around
 claudes remove W
@@ -61,24 +57,31 @@ Colors: `red orange yellow green teal blue indigo violet purple pink`, or a raw 
 
 ## Updating
 
-When the main Claude Desktop app updates itself, your colored copies don't update automatically — rebuild them from the refreshed original:
+Nothing to do. Your instances run your real Claude Desktop app, so when Claude updates
+itself, every instance runs the new version on next launch.
 
-```bash
-claudes rebuild --all
-```
+If you installed instances with an older version of `claudes` (full-copy clones), re-add each
+one once to convert it to a launcher — `claudes list` marks them `legacy`:
+
+    claudes add B blue Claude-Acct-Work
 
 ## How it works
 
-Each instance is built from your existing `/Applications/Claude.app`:
+Each instance is a small launcher app — it does **not** copy or modify Claude. When you run
+`claudes add`:
 
-1. **Copy** the app bundle to `/Applications/Claude <LETTER>.app`.
-2. **Re-identify** it — new `CFBundleIdentifier` and display name, so macOS treats it as a distinct app.
-3. **Isolate data** by shimming the executable to launch with its own `--user-data-dir`, so each instance keeps a separate login/session.
-4. **Recolor** the app icon to the requested hue.
-5. **Re-sign ad-hoc**, inside-out (frameworks and libraries first, then the app bundle), including an entitlement that disables library validation, so the modified, unsigned copy still launches.
-6. **Set a custom Finder icon** so the colored icon shows correctly in the Dock and Finder.
+1. **Create a launcher bundle** at `/Applications/Claude <LETTER>.app` (a few hundred KB: an
+   `Info.plist`, a launch script, and an icon).
+2. **Give it its own identity** — distinct `CFBundleIdentifier` and display name, so macOS
+   treats it as a separate app with its own Dock tile and Cmd-Tab entry.
+3. **Delegate to your real Claude** — the launch script `exec`s your existing
+   `/Applications/Claude.app` with its own `--user-data-dir`, so each instance keeps a
+   separate login/session.
+4. **Recolor the icon** to the requested hue.
 
-Honest note: step 5 disables library validation on the local copy so the re-signed binary can load its (unmodified, unsigned-by-us) frameworks. Native multi-account support in Claude Desktop would remove the need for any of this.
+Because your `Claude.app` is never touched, it keeps its original Anthropic signature — there
+is no re-signing and nothing disables any macOS security protection. And since every instance
+runs your live `Claude.app`, they pick up Claude's auto-updates automatically.
 
 ## License
 
