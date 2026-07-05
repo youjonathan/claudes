@@ -6,7 +6,7 @@ Run multiple Claude Desktop accounts side by side on macOS, each with its own co
 
 ## Why
 
-If you have a work Claude account and a personal one, macOS only lets you run one Claude Desktop session at a time. `claudes` makes copies of your local Claude Desktop install, each pointed at its own profile directory and given its own color-coded Dock icon, so you can keep, say, a red "work" instance and a blue "personal" instance open side by side and tell them apart at a glance.
+If you have a work Claude account and a personal one, macOS only lets you run one Claude Desktop session at a time. `claudes` creates a small launcher for your local Claude Desktop install, each pointed at its own profile directory and given its own color-coded Dock icon, so you can keep, say, a red "work" instance and a blue "personal" instance open side by side and tell them apart at a glance.
 
 ## Disclaimer
 
