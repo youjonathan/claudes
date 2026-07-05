@@ -16,7 +16,6 @@ claudes — run multiple Claude Desktop accounts side by side (macOS)
 
   claudes add <LETTER> <COLOR> [PROFILE]   create/replace a colored instance
   claudes list                             show configured instances + status
-  claudes rebuild [--all | <LETTER>]       rebuild after a Claude update
   claudes remove <LETTER> [--purge]        delete instance (keeps profile unless --purge)
   claudes rainbow                          create R,O,Y,G,B,I,V instances
   claudes doctor                           check environment
@@ -36,33 +35,23 @@ cmd_add() {
 }
 
 cmd_list() {
-  printf '%-8s %-8s %-24s %-8s %s\n' LETTER COLOR PROFILE STATUS VERSION
+  local mv; mv="$(main_version)"; [ -n "$mv" ] || mv="-"
+  _LEGACY_SEEN=0
+  printf '%-8s %-8s %-24s %-10s %s\n' LETTER COLOR PROFILE STATUS VERSION
   _row() {
-    local st="stopped" ver
-    pgrep -f "/Applications/Claude $1\.app/Contents/MacOS/Claude-bin" >/dev/null && st="running"
-    ver="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "/Applications/Claude $1.app/Contents/Info.plist" 2>/dev/null || echo "-")"
-    printf '%-8s %-8s %-24s %-8s %s\n' "$1" "$2" "$3" "$st" "$ver"
+    local suffix="$1" color="$2" prof="$3"
+    local datadir="$HOME/Library/Application Support/${prof}"
+    local st="stopped"
+    pgrep -f "user-data-dir=$datadir" >/dev/null 2>&1 && st="running"
+    if is_legacy_instance "$suffix"; then st="legacy"; _LEGACY_SEEN=1; fi
+    printf '%-8s %-8s %-24s %-10s %s\n' "$suffix" "$color" "$prof" "$st" "$mv"
   }
   config_each _row
-}
-
-cmd_rebuild() {
-  local ver; ver="$(main_version)"
-  [ -n "$ver" ] || { echo "ERROR: $CLAUDES_APP_SRC missing/unreadable — cannot rebuild"; exit 1; }
-  echo "== rebuilding from main Claude v$ver =="
-  local target="${1:---all}" failed=0
-  _rb() {
-    if [ "$target" != "--all" ] && [ "$target" != "$1" ]; then return; fi
-    local hue; hue="$(color_to_hue "$2")" || { echo "SKIP $1: bad color $2"; failed=1; return; }
-    # subshell wrapper: build_instance's own `set -e` only fires reliably when it
-    # isn't itself the direct test of `if`/`!` (bash suppresses inherited errexit
-    # there) — running it in a subshell lets its internal set -e work, while the
-    # subshell's own exit code is what `if !` correctly tests.
-    if ! ( build_instance "$1" "$hue" "$3" ); then echo "FAILED: Claude $1"; failed=1; fi
-  }
-  config_each _rb
-  [ "$failed" = 0 ] || { echo "== one or more instances FAILED =="; exit 1; }
-  echo "== all instances rebuilt on v$ver =="
+  if [ "$_LEGACY_SEEN" = 1 ]; then
+    echo
+    echo "note: 'legacy' rows are old full-copy clones with no auto-update path."
+    echo "      re-run 'claudes add <LETTER> <color> <profile>' to migrate each."
+  fi
 }
 
 cmd_remove() {
@@ -88,7 +77,7 @@ cmd_rainbow() {
 
 cmd_doctor() {
   echo "main Claude: $([ -d "$CLAUDES_APP_SRC" ] && main_version || echo MISSING)"
-  for t in codesign swift iconutil sips; do
+  for t in swift iconutil; do
     printf '  %-9s %s\n' "$t" "$(command -v "$t" >/dev/null && echo ok || echo MISSING)"
   done
   echo "config: $CLAUDES_CONFIG"; cmd_list
@@ -105,7 +94,6 @@ cmd_egg() {
 case "${1:-}" in
   add) shift; cmd_add "$@";;
   list) shift; cmd_list "$@";;
-  rebuild) shift; cmd_rebuild "$@";;
   remove) shift; cmd_remove "$@";;
   rainbow) shift; cmd_rainbow "$@";;
   doctor) shift; cmd_doctor "$@";;
