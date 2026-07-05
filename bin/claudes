@@ -35,16 +35,16 @@ cmd_add() {
 }
 
 cmd_list() {
-  local mv; mv="$(main_version)"; [ -n "$mv" ] || mv="-"
+  local mv; mv="$(main_version)" || mv="-"; [ -n "$mv" ] || mv="-"
   _LEGACY_SEEN=0
   printf '%-8s %-8s %-24s %-10s %s\n' LETTER COLOR PROFILE STATUS VERSION
   _row() {
     local suffix="$1" color="$2" prof="$3"
     local datadir="$HOME/Library/Application Support/${prof}"
-    local st="stopped"
+    local st="stopped" ver="$mv"
     pgrep -f "user-data-dir=$datadir" >/dev/null 2>&1 && st="running"
-    if is_legacy_instance "$suffix"; then st="legacy"; _LEGACY_SEEN=1; fi
-    printf '%-8s %-8s %-24s %-10s %s\n' "$suffix" "$color" "$prof" "$st" "$mv"
+    if is_legacy_instance "$suffix"; then st="legacy"; ver="(frozen)"; _LEGACY_SEEN=1; fi
+    printf '%-8s %-8s %-24s %-10s %s\n' "$suffix" "$color" "$prof" "$st" "$ver"
   }
   config_each _row
   if [ "$_LEGACY_SEEN" = 1 ]; then
