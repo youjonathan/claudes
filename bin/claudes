@@ -77,7 +77,7 @@ cmd_rainbow() {
 
 cmd_doctor() {
   echo "main Claude: $([ -d "$CLAUDES_APP_SRC" ] && main_version || echo MISSING)"
-  for t in swift iconutil; do
+  for t in swift iconutil clang; do
     printf '  %-9s %s\n' "$t" "$(command -v "$t" >/dev/null && echo ok || echo MISSING)"
   done
   echo "config: $CLAUDES_CONFIG"; cmd_list

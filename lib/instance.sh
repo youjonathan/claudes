@@ -37,17 +37,29 @@ build_instance() { # suffix hue profile-name
 </dict></plist>
 EOF
 
-  echo ">> [$suffix] launch shim -> delegate to live Claude.app (--user-data-dir=$datadir)"
-  cat > "$dst/Contents/MacOS/launch" <<EOF
-#!/bin/bash
-CLAUDE="$CLAUDES_APP_SRC/Contents/MacOS/Claude"
-if [ ! -x "\$CLAUDE" ]; then
-  osascript -e 'display alert "Claude not found" message "Expected at $CLAUDES_APP_SRC — reinstall Claude Desktop, then relaunch."' >/dev/null 2>&1
-  exit 1
-fi
-exec "\$CLAUDE" --user-data-dir="$datadir" "\$@"
+  echo ">> [$suffix] compiling launcher -> delegate to live Claude.app (--user-data-dir=$datadir)"
+  cat > "$scratch/launch.c" <<EOF
+#include <unistd.h>
+#include <stdlib.h>
+
+int main(int argc, char *argv[]) {
+    const char *claude = "$CLAUDES_APP_SRC/Contents/MacOS/Claude";
+    const char *datadir_arg = "--user-data-dir=$datadir";
+
+    char **new_argv = malloc(sizeof(char *) * (argc + 2));
+    new_argv[0] = (char *)claude;
+    new_argv[1] = (char *)datadir_arg;
+    for (int i = 1; i < argc; i++) new_argv[i + 1] = argv[i];
+    new_argv[argc + 1] = NULL;
+
+    execv(claude, new_argv);
+    /* only reached if execv failed (e.g. Claude.app moved/removed) */
+    system("osascript -e 'display alert \"Claude not found\" message \"Expected at $CLAUDES_APP_SRC — reinstall Claude Desktop, then relaunch.\"' >/dev/null 2>&1");
+    return 1;
+}
 EOF
-  chmod +x "$dst/Contents/MacOS/launch"
+  clang -O2 -o "$dst/Contents/MacOS/launch" "$scratch/launch.c"
+  codesign --force --sign - "$dst/Contents/MacOS/launch" >/dev/null 2>&1
   mkdir -p "$datadir"
 
   echo ">> [$suffix] recolor icon (hue $hue)"

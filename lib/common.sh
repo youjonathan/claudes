@@ -30,7 +30,7 @@ valid_profile() { # $1: profile dir name. single path component, no whitespace/q
 
 preflight() { # verify deps + main app BEFORE any build step
   local bad=0
-  for t in swift iconutil; do
+  for t in swift iconutil clang; do
     command -v "$t" >/dev/null 2>&1 || { echo "ERROR: '$t' missing — run: xcode-select --install"; bad=1; }
   done
   [ -d "$CLAUDES_APP_SRC" ] || { echo "ERROR: $CLAUDES_APP_SRC not found — install Claude Desktop first"; bad=1; }

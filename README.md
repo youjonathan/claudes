@@ -70,18 +70,21 @@ one once to convert it to a launcher — `claudes list` marks them `legacy`:
 Each instance is a small launcher app — it does **not** copy or modify Claude. When you run
 `claudes add`:
 
-1. **Create a launcher bundle** at `/Applications/Claude <LETTER>.app` (a few hundred KB: an
-   `Info.plist`, a launch script, and an icon).
+1. **Create a launcher bundle** at `/Applications/Claude <LETTER>.app` (a couple hundred KB: an
+   `Info.plist`, a tiny compiled launcher binary, and an icon).
 2. **Give it its own identity** — distinct `CFBundleIdentifier` and display name, so macOS
    treats it as a separate app with its own Dock tile and Cmd-Tab entry.
-3. **Delegate to your real Claude** — the launch script `exec`s your existing
+3. **Delegate to your real Claude** — the launcher `exec`s your existing
    `/Applications/Claude.app` with its own `--user-data-dir`, so each instance keeps a
    separate login/session.
 4. **Recolor the icon** to the requested hue.
 
-Because your `Claude.app` is never touched, it keeps its original Anthropic signature — there
-is no re-signing and nothing disables any macOS security protection. And since every instance
-runs your live `Claude.app`, they pick up Claude's auto-updates automatically.
+The launcher itself is a small, freshly-compiled binary (built from source each time, via
+`clang`) with an ad-hoc code signature — this is what gives it a fast, clean launch under
+macOS's Gatekeeper checks; earlier versions used a plain shell script here, which macOS treats
+as unsigned and re-scans on every launch, adding a 20-30+ second delay. Either way, your
+`Claude.app` is never touched — it keeps its original Anthropic signature, and since every
+instance runs your live `Claude.app`, they pick up Claude's auto-updates automatically.
 
 ## License
 
