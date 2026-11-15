@@ -1,35 +1,514 @@
 #!/bin/bash
 # lib/update.sh — claudes update. Source, do not execute.
 
-# [--dry-run] [--watch-run] -> install a waiting Claude update and reopen accounts; exit status 0/1
-cmd_update() { echo "claudes: cmd_update not implemented yet" >&2; return 1; }
+# globals shared by the step functions (cmd_update sets them)
+UPDATE_DRY=0               # 1 = dry run: never signal, open, write state or lock
+UPDATE_ACCOUNTS=""         # lines DATADIR<TAB>LAUNCHER for the accounts being handled
+UPDATE_OLD_BUILD=""        # installed build before the quit
+UPDATE_OLD_VERSION=""      # installed version before the quit
+UPDATE_LOG_OFFSET=0        # ShipIt log size before the quit
 
-# -> prints update/watcher/launcher lines for claudes doctor; always status 0 (placeholder prints nothing)
-doctor_update_report() { return 0; }
+claudes_open() { open "$@"; }   # every open goes through here so tests can replace it
+
+update_pending_file() { echo "$CLAUDES_STATE_DIR/reopen-pending"; }
+
+# DATADIR LAUNCHER -> the name to show the user (launcher name like "Claude C", else the folder name)
+update_account_name() {
+  local b
+  if [ -n "${2:-}" ]; then b="$(basename "$2")"; echo "${b%.app}"; else basename "$1"; fi
+}
+
+# newline-separated DATADIR<TAB>LAUNCHER lines on $1 -> "Claude A, Claude C"
+update_names_of() {
+  local d l out="" n
+  while IFS=$'\t' read -r d l; do
+    [ -n "$d" ] || continue
+    n="$(update_account_name "$d" "$l")"
+    if [ -n "$out" ]; then out="$out, $n"; else out="$n"; fi
+  done <<EOF
+$1
+EOF
+  printf '%s' "$out"
+}
+
+# [--dry-run] [--watch-run] -> install a waiting Claude update and reopen accounts; exit status 0/1
+cmd_update() {
+  local dry=0 watch=0 arg blocked rc=0
+  for arg in "$@"; do
+    case "$arg" in
+      --dry-run) dry=1;;
+      --watch-run) watch=1;;
+      *) echo "claudes update: unknown option '$arg'" >&2
+         echo "usage: claudes update [--dry-run] [--watch-run]" >&2
+         return 1;;
+    esac
+  done
+  UPDATE_DRY="$dry"
+
+  if blocked="$(auto_updates_blocked)"; then
+    echo "Claude's own updater is switched off by this file:"
+    echo "  $blocked"
+    echo "claudes update works with Claude's own updater, so it needs the updater on. Nothing was changed."
+    if [ "$dry" = 1 ]; then return 0; fi
+    return 1
+  fi
+
+  if [ "$dry" = 0 ] && inside_claude_copy; then
+    echo "This command is running inside a Claude window. Quitting Claude would stop it half way and nothing would reopen your accounts."
+    echo "Run it from Terminal instead, not from inside Claude."
+    return 1
+  fi
+
+  if [ "$dry" = 1 ]; then
+    _update_run "$watch" || rc=$?
+    return "$rc"
+  fi
+
+  if ! update_lock; then
+    echo "Another claudes update is already in progress, so this one is stopping. Nothing was changed."
+    return 0
+  fi
+  _update_run "$watch" || rc=$?
+  update_unlock
+  return "$rc"
+}
+
+# WATCH(0|1) -> steps 4-10 of the flow; status 0/1
+_update_run() {
+  local watch="$1" state pf busy old new d l n names
+  pf="$(update_pending_file)"
+  state="$(update_state 2>/dev/null || true)"
+
+  # a previous run that was interrupted leaves its list of accounts behind
+  if [ -f "$pf" ] && [ "$state" != waiting ]; then
+    names="$(update_names_of "$(cat "$pf")")"
+    if [ "$UPDATE_DRY" = 1 ]; then
+      echo "A previous update run was interrupted. It would reopen: $names"
+    else
+      echo "A previous update run was interrupted. Reopening: $names"
+      update_reopen_accounts || true
+    fi
+  fi
+
+  case "$state" in
+    none)
+      echo "No Claude update is waiting."
+      update_safety_net
+      return 0;;
+    no-installer)
+      echo "A Claude update was downloaded, but Claude's installer is not waiting for it."
+      echo "It will come back by itself the next time Claude starts. Nothing needs doing now."
+      update_safety_net
+      return 0;;
+    waiting) ;;
+    *) echo "Could not tell whether a Claude update is waiting. Nothing was changed."
+       return 1;;
+  esac
+
+  old="$(installed_build 2>/dev/null || true)"; new="$(staged_build 2>/dev/null || true)"
+  echo "A Claude update is waiting to install (build ${old:-?} -> ${new:-?})."
+
+  local waited=0
+  while :; do
+    UPDATE_ACCOUNTS="$(update_open_accounts)"
+    if busy="$(update_all_idle)"; then break; fi
+
+    if [ "$UPDATE_DRY" = 1 ]; then
+      _update_print_plan "$busy"
+      return 0
+    fi
+    echo "$busy"
+    if [ "$watch" = 1 ]; then
+      echo "Not updating now. The background helper will try again later."
+      return 0
+    fi
+    if [ "$waited" -ge "$CLAUDES_MAX_WAIT" ]; then
+      echo "Gave up waiting after $((waited / 60)) minutes because an account is still busy. Nothing was quit."
+      return 1
+    fi
+    echo "Checking again in $CLAUDES_POLL seconds."
+    claudes_sleep "$CLAUDES_POLL"
+    waited=$((waited + CLAUDES_POLL))
+    state="$(update_state 2>/dev/null || true)"
+    if [ "$state" != waiting ]; then
+      echo "The update is no longer waiting. Nothing was quit."
+      return 0
+    fi
+  done
+
+  if [ "$UPDATE_DRY" = 1 ]; then
+    _update_print_plan ""
+    return 0
+  fi
+
+  if [ -z "$UPDATE_ACCOUNTS" ]; then
+    echo "No Claude copy is open, so Claude's installer can run by itself."
+  fi
+  if ! update_quit_all; then
+    echo "The update was not started. Reopening the accounts that were closed."
+    update_reopen_accounts || true
+    return 1
+  fi
+
+  local install_ok=0
+  update_wait_install || install_ok=1
+  if [ "$install_ok" = 0 ]; then
+    update_close_plain_relaunch || true
+  fi
+  local reopen_rc=0
+  update_reopen_accounts || reopen_rc=1
+
+  if [ "$install_ok" = 1 ]; then
+    echo "The update did not install. Your accounts were reopened on the old version."
+    return 1
+  fi
+  echo "Claude updated: $(_update_ver "$UPDATE_OLD_VERSION" "$UPDATE_OLD_BUILD") -> $(_update_ver "$(main_version 2>/dev/null || true)" "$(installed_build 2>/dev/null || true)")"
+  return "$reopen_rc"
+}
+
+# VERSION BUILD -> "1.2.3 (build 456)"
+_update_ver() { echo "${1:-?} (build ${2:-?})"; }
+
+# BUSYTEXT -> prints the dry-run plan
+_update_print_plan() {
+  local busy="$1" d l n line how
+  echo
+  echo "Open accounts:"
+  if [ -z "$UPDATE_ACCOUNTS" ]; then echo "  none"; fi
+  while IFS=$'\t' read -r d l; do
+    [ -n "$d" ] || continue
+    n="$(update_account_name "$d" "$l")"
+    line="$(printf '%s\n' "$busy" | grep -F -- "$n is busy" | head -n 1 || true)"
+    if [ -n "$line" ]; then echo "  $line"; else echo "  $n: idle"; fi
+  done <<EOF
+$UPDATE_ACCOUNTS
+EOF
+  echo
+  echo "What claudes update would do:"
+  if [ -n "$busy" ]; then
+    echo "  1. Wait until every open account is idle (right now it would wait, see above)."
+  else
+    echo "  1. Wait until every open account is idle (they all are right now)."
+  fi
+  echo "  2. Quit these together: $(update_names_of "$UPDATE_ACCOUNTS")"
+  echo "  3. Let Claude's installer run, then close the plain Claude it opens afterwards."
+  echo "  4. Reopen each account:"
+  while IFS=$'\t' read -r d l; do
+    [ -n "$d" ] || continue
+    n="$(update_account_name "$d" "$l")"
+    if [ -n "$l" ]; then how="from its own launcher"; else how="with the plain Claude icon (no launcher)"; fi
+    echo "       $n, $how"
+  done <<EOF
+$UPDATE_ACCOUNTS
+EOF
+  echo
+  echo "Dry run: nothing was quit, opened or changed."
+}
+
+# -> prints update/watcher/launcher lines for claudes doctor; always status 0
+doctor_update_report() {
+  local p state pid d
+  if p="$(auto_updates_blocked 2>/dev/null)"; then
+    echo "auto-updates: BLOCKED by $p (claudes update needs Claude's own updater on)"
+  else
+    echo "auto-updates: on"
+  fi
+  state="$(update_state 2>/dev/null || true)"
+  case "$state" in
+    waiting) echo "update: waiting";;
+    no-installer) echo "update: downloaded but installer not waiting";;
+    *) echo "update: none";;
+  esac
+  if [ -f "$CLAUDES_LAUNCHAGENTS_DIR/${CLAUDES_WATCH_LABEL:-}.plist" ]; then
+    echo "watcher: installed"
+  else
+    echo "watcher: not installed"
+  fi
+  while IFS=$'\t' read -r pid d; do
+    [ -n "$d" ] || continue
+    if [ -z "$(launcher_for "$d" 2>/dev/null || true)" ]; then
+      echo "note: $d is open without a launcher; after an update it reopens with the plain Claude icon"
+    fi
+  done < <(claude_main_procs 2>/dev/null || true)
+  return 0
+}
 
 # -> lines DATADIR<TAB>LAUNCHER for running accounts plus accounts down with a fresh update marker
-update_open_accounts() { echo "claudes: update_open_accounts not implemented yet" >&2; return 1; }
+update_open_accounts() {
+  local nl=$'\n' seen="$nl" pid d l age pf
+  while IFS=$'\t' read -r pid d; do
+    [ -n "$d" ] || continue
+    case "$seen" in *"$nl$d$nl"*) continue;; esac
+    seen="$seen$d$nl"
+    printf '%s\t%s\n' "$d" "$(launcher_for "$d" 2>/dev/null || true)"
+  done < <(claude_main_procs 2>/dev/null || true)
 
-# -> status 0 when every open account is idle; prints who is busy otherwise
-update_all_idle() { echo "claudes: update_all_idle not implemented yet" >&2; return 1; }
+  while IFS=$'\t' read -r d l; do
+    [ -n "$d" ] || continue
+    case "$seen" in *"$nl$d$nl"*) continue;; esac
+    if datadir_running "$d"; then continue; fi
+    marker_says_update_quit "$d" || continue
+    age="$(marker_age "$d" 2>/dev/null || true)"
+    case "$age" in ''|*[!0-9]*) continue;; esac
+    [ "$age" -le "$CLAUDES_MARKER_MAX_AGE" ] || continue
+    seen="$seen$d$nl"
+    printf '%s\t%s\n' "$d" "$l"
+  done < <(known_accounts 2>/dev/null || true)
+
+  # accounts a half-finished run already closed
+  pf="$(update_pending_file)"
+  if [ -f "$pf" ]; then
+    while IFS=$'\t' read -r d l; do
+      [ -n "$d" ] || continue
+      case "$seen" in *"$nl$d$nl"*) continue;; esac
+      seen="$seen$d$nl"
+      printf '%s\t%s\n' "$d" "$l"
+    done < "$pf"
+  fi
+  return 0
+}
+
+# -> status 0 when every account in $UPDATE_ACCOUNTS is idle; prints "NAME is busy: reason" lines otherwise
+update_all_idle() {
+  local tmp i=0 d l n rc reason busy=0
+  [ -n "$UPDATE_ACCOUNTS" ] || return 0
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/claudes-idle.XXXXXX")"
+  while IFS=$'\t' read -r d l; do
+    [ -n "$d" ] || continue
+    i=$((i + 1))
+    ( rc=0; reason="$(account_idle "$d")" || rc=$?
+      echo "$rc" > "$tmp/$i.rc"; printf '%s' "$reason" > "$tmp/$i.reason" ) </dev/null &
+  done <<EOF
+$UPDATE_ACCOUNTS
+EOF
+  wait
+  i=0
+  while IFS=$'\t' read -r d l; do
+    [ -n "$d" ] || continue
+    i=$((i + 1))
+    rc="$(cat "$tmp/$i.rc" 2>/dev/null || echo 1)"
+    if [ "$rc" != 0 ]; then
+      n="$(update_account_name "$d" "$l")"
+      reason="$(cat "$tmp/$i.reason" 2>/dev/null || true)"
+      if [ -n "$reason" ]; then echo "$n is busy: $reason"; else echo "$n is busy."; fi
+      busy=1
+    fi
+  done <<EOF
+$UPDATE_ACCOUNTS
+EOF
+  rm -rf "$tmp"
+  return "$busy"
+}
 
 # -> write reopen-pending, record build and log offset, stop every open account together; status 1 if any refuses
-update_quit_all() { echo "claudes: update_quit_all not implemented yet" >&2; return 1; }
+update_quit_all() {
+  local pf tmp i=0 d l n fail=0 kept=""
+  pf="$(update_pending_file)"
+  mkdir -p "$CLAUDES_STATE_DIR"
+  printf '%s\n' "$UPDATE_ACCOUNTS" | sed '/^$/d' > "$pf.tmp"
+  mv "$pf.tmp" "$pf"
+  UPDATE_OLD_BUILD="$(installed_build 2>/dev/null || true)"
+  UPDATE_OLD_VERSION="$(main_version 2>/dev/null || true)"
+  UPDATE_LOG_OFFSET="$(shipit_log_size 2>/dev/null || echo 0)"
+  case "$UPDATE_LOG_OFFSET" in ''|*[!0-9]*) UPDATE_LOG_OFFSET=0;; esac
+
+  [ -z "$UPDATE_ACCOUNTS" ] || echo "Quitting together: $(update_names_of "$UPDATE_ACCOUNTS")"
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/claudes-stop.XXXXXX")"
+  while IFS=$'\t' read -r d l; do
+    [ -n "$d" ] || continue
+    i=$((i + 1))
+    ( if stop_datadir "$d" "$CLAUDES_STOP_TIMEOUT"; then echo 0; else echo 1; fi > "$tmp/$i.rc" ) </dev/null &
+  done <<EOF
+$UPDATE_ACCOUNTS
+EOF
+  wait
+  i=0
+  while IFS=$'\t' read -r d l; do
+    [ -n "$d" ] || continue
+    i=$((i + 1))
+    if [ "$(cat "$tmp/$i.rc" 2>/dev/null || echo 1)" != 0 ]; then
+      n="$(update_account_name "$d" "$l")"
+      echo "$n would not quit, even when forced."
+      fail=1
+    else
+      kept="$kept$d"$'\t'"$l"$'\n'
+    fi
+  done <<EOF
+$UPDATE_ACCOUNTS
+EOF
+  rm -rf "$tmp"
+  if [ "$fail" = 1 ]; then
+    printf '%s' "$kept" > "$pf"   # only the accounts that really closed need reopening
+  fi
+  return "$fail"
+}
 
 # -> poll ShipIt up to $CLAUDES_INSTALL_TIMEOUT; status 0 on success, 1 on failure/timeout (prints matching log lines)
-update_wait_install() { echo "claudes: update_wait_install not implemented yet" >&2; return 1; }
+update_wait_install() {
+  local waited=0 build log hits
+  echo "Waiting for Claude's installer to finish..."
+  while :; do
+    build="$(installed_build 2>/dev/null || true)"
+    log="$(shipit_log_since "$UPDATE_LOG_OFFSET" 2>/dev/null || true)"
+    if { [ -n "$build" ] && [ "$build" != "$UPDATE_OLD_BUILD" ]; } \
+       || printf '%s\n' "$log" | grep -q 'Installation completed successfully'; then
+      return 0
+    fi
+    hits="$(printf '%s\n' "$log" | grep -E 'Aborting update attempt|Installation cancelled|Installation error|Too many attempts' || true)"
+    if [ -n "$hits" ]; then
+      echo "Claude's installer failed. Its log says:"
+      printf '%s\n' "$hits" | sed 's/^/  /'
+      return 1
+    fi
+    if [ "$waited" -ge "$CLAUDES_INSTALL_TIMEOUT" ]; then
+      echo "Claude's installer did not finish within $((CLAUDES_INSTALL_TIMEOUT / 60)) minutes ($CLAUDES_INSTALL_TIMEOUT seconds)."
+      if [ -n "$log" ]; then
+        echo "The last thing its log said:"
+        printf '%s\n' "$log" | tail -n 3 | sed 's/^/  /'
+      else
+        echo "Its log has not said anything new."
+      fi
+      return 1
+    fi
+    claudes_sleep 2
+    waited=$((waited + 2))
+  done
+}
 
 # -> stop the plain copy ShipIt relaunches when it is not wanted; status 0
-update_close_plain_relaunch() { echo "claudes: update_close_plain_relaunch not implemented yet" >&2; return 1; }
+update_close_plain_relaunch() {
+  local def="$CLAUDES_SUPPORT_DIR/Claude" pf waited=0 d l in_pending=0 launcher=""
+  pf="$(update_pending_file)"
+  while [ "$waited" -lt 20 ]; do
+    if shipit_log_since "$UPDATE_LOG_OFFSET" 2>/dev/null | grep -q 'Successfully launched application' \
+       || datadir_running "$def"; then
+      break
+    fi
+    claudes_sleep 2
+    waited=$((waited + 2))
+  done
+  datadir_running "$def" || return 0
+
+  if [ -f "$pf" ]; then
+    while IFS=$'\t' read -r d l; do
+      if [ "$d" = "$def" ]; then in_pending=1; launcher="$l"; fi
+    done < "$pf"
+  fi
+  [ -n "$launcher" ] || launcher="$(launcher_for "$def" 2>/dev/null || true)"
+
+  # a plain copy is only wanted when the default folder was open before and has no launcher
+  if [ -n "$launcher" ] || [ "$in_pending" = 0 ]; then
+    echo "Closing the plain Claude that the installer opened."
+    if ! stop_datadir "$def" "$CLAUDES_STOP_TIMEOUT"; then
+      echo "The plain Claude would not close. Leaving it open."
+    fi
+  else
+    echo "Leaving the plain Claude that the installer opened running, because it was open before."
+  fi
+  return 0
+}
+
+# FILE -> reopen every DATADIR<TAB>LAUNCHER line in FILE and confirm each is running; status 1 if any did not come up
+_update_reopen_file() {
+  local f="$1" d l n first=1 tries fail=0
+  while IFS=$'\t' read -r d l; do
+    [ -n "$d" ] || continue
+    n="$(update_account_name "$d" "$l")"
+    if datadir_running "$d"; then
+      echo "$n is already open."
+      continue
+    fi
+    if [ "$first" = 0 ]; then claudes_sleep 2; fi
+    first=0
+    if [ -n "$l" ]; then
+      echo "Reopening $n from its launcher."
+      claudes_open "$l" </dev/null || { echo "Could not open $n."; fail=1; }
+    elif [ "$d" = "$CLAUDES_SUPPORT_DIR/Claude" ]; then
+      echo "Reopening Claude (plain, no launcher)."
+      claudes_open "$CLAUDES_APP_SRC" </dev/null || { echo "Could not open Claude."; fail=1; }
+    else
+      echo "Reopening $n. It has no launcher, so its Dock icon will be the plain Claude icon."
+      claudes_open -n -a "$CLAUDES_APP_SRC" --args "--user-data-dir=$d" </dev/null || { echo "Could not open $n."; fail=1; }
+    fi
+  done < "$f"
+
+  while IFS=$'\t' read -r d l; do
+    [ -n "$d" ] || continue
+    n="$(update_account_name "$d" "$l")"
+    tries=0
+    while ! datadir_running "$d"; do
+      if [ "$tries" -ge 15 ]; then
+        echo "$n did not come back up. Open it yourself from the Dock or Launchpad."
+        fail=1
+        break
+      fi
+      claudes_sleep 2
+      tries=$((tries + 1))
+    done
+  done < "$f"
+  return "$fail"
+}
 
 # -> reopen every account in reopen-pending and confirm each is running; status 1 if any did not come up
-update_reopen_accounts() { echo "claudes: update_reopen_accounts not implemented yet" >&2; return 1; }
+update_reopen_accounts() {
+  local pf rc=0
+  pf="$(update_pending_file)"
+  [ -f "$pf" ] || return 0
+  _update_reopen_file "$pf" || rc=1
+  rm -f "$pf"
+  return "$rc"
+}
 
 # -> reopen accounts that quit for an update but never came back; status 0
-update_safety_net() { echo "claudes: update_safety_net not implemented yet" >&2; return 1; }
+update_safety_net() {
+  local d l age n tmp="" state found=0
+  state="$(update_state 2>/dev/null || true)"
+  if [ "$state" = waiting ]; then return 0; fi
+  if [ "$UPDATE_DRY" != 1 ]; then
+    mkdir -p "$CLAUDES_STATE_DIR"
+    tmp="$(mktemp "$CLAUDES_STATE_DIR/reopen-net.XXXXXX")"
+  fi
+  while IFS=$'\t' read -r d l; do
+    [ -n "$d" ] || continue
+    if datadir_running "$d"; then continue; fi
+    marker_says_update_quit "$d" || continue
+    age="$(marker_age "$d" 2>/dev/null || true)"
+    case "$age" in ''|*[!0-9]*) continue;; esac
+    [ "$age" -ge "$CLAUDES_MARKER_GRACE" ] || continue
+    [ "$age" -le "$CLAUDES_MARKER_MAX_AGE" ] || continue
+    n="$(update_account_name "$d" "$l")"
+    found=1
+    if [ "$UPDATE_DRY" = 1 ]; then
+      echo "Would reopen $n: it quit for an update $((age / 60)) minutes ago and did not come back."
+    else
+      echo "$n quit for an update $((age / 60)) minutes ago and did not come back."
+      printf '%s\t%s\n' "$d" "$l" >> "$tmp"
+    fi
+  done < <(known_accounts 2>/dev/null || true)
+  if [ "$UPDATE_DRY" != 1 ]; then
+    if [ "$found" = 1 ]; then _update_reopen_file "$tmp" || true; fi
+    rm -f "$tmp"
+  fi
+  return 0
+}
 
 # -> take $CLAUDES_STATE_DIR/update.lock (pid file inside); status 1 if busy
-update_lock() { echo "claudes: update_lock not implemented yet" >&2; return 1; }
+update_lock() {
+  local lock="$CLAUDES_STATE_DIR/update.lock" pid
+  mkdir -p "$CLAUDES_STATE_DIR"
+  if ! mkdir "$lock" 2>/dev/null; then
+    pid="$(cat "$lock/pid" 2>/dev/null || true)"
+    if [ -z "$pid" ]; then   # the other run may be between mkdir and writing its pid
+      claudes_sleep 1
+      pid="$(cat "$lock/pid" 2>/dev/null || true)"
+    fi
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then return 1; fi
+    rm -rf "$lock"
+    mkdir "$lock" 2>/dev/null || return 1
+  fi
+  echo $$ > "$lock/pid"
+  return 0
+}
 
 # -> release the update lock
-update_unlock() { echo "claudes: update_unlock not implemented yet" >&2; return 1; }
+update_unlock() { rm -rf "$CLAUDES_STATE_DIR/update.lock"; return 0; }
