@@ -1,9 +1,27 @@
 #!/bin/bash
 # lib/common.sh — shared helpers. Source, do not execute.
-CLAUDES_APP_SRC="/Applications/Claude.app"
+CLAUDES_APP_SRC="${CLAUDES_APP_SRC:-/Applications/Claude.app}"
 CLAUDES_BASE_ID="com.anthropic.claudefordesktop"
 
 CLAUDES_APPS_DIR="${CLAUDES_APPS_DIR:-/Applications}"
+CLAUDES_SUPPORT_DIR="${CLAUDES_SUPPORT_DIR:-$HOME/Library/Application Support}"
+CLAUDES_SHIPIT_DIR="${CLAUDES_SHIPIT_DIR:-$HOME/Library/Caches/com.anthropic.claudefordesktop.ShipIt}"
+CLAUDES_MANAGED_PREFS_DIR="${CLAUDES_MANAGED_PREFS_DIR:-/Library/Managed Preferences}"
+CLAUDES_LAUNCHAGENTS_DIR="${CLAUDES_LAUNCHAGENTS_DIR:-$HOME/Library/LaunchAgents}"
+CLAUDES_STATE_DIR="${CLAUDES_STATE_DIR:-$HOME/Library/Application Support/claudes}"
+CLAUDES_LOG_DIR="${CLAUDES_LOG_DIR:-$HOME/Library/Logs/claudes}"
+# timing (seconds unless noted)
+CLAUDES_POLL="${CLAUDES_POLL:-60}"                     # idle re-check
+CLAUDES_IDLE_MINUTES="${CLAUDES_IDLE_MINUTES:-10}"     # minutes (session files untouched)
+CLAUDES_CPU_SAMPLE="${CLAUDES_CPU_SAMPLE:-20}"
+CLAUDES_CPU_IDLE="${CLAUDES_CPU_IDLE:-2}"              # cpu-seconds allowed in the sample
+CLAUDES_STOP_TIMEOUT="${CLAUDES_STOP_TIMEOUT:-30}"
+CLAUDES_INSTALL_TIMEOUT="${CLAUDES_INSTALL_TIMEOUT:-300}"
+CLAUDES_MAX_WAIT="${CLAUDES_MAX_WAIT:-14400}"
+CLAUDES_MARKER_GRACE="${CLAUDES_MARKER_GRACE:-300}"
+CLAUDES_MARKER_MAX_AGE="${CLAUDES_MARKER_MAX_AGE:-43200}"
+
+claudes_sleep() { sleep "$1"; }   # wrapper so tests can stub it
 
 is_legacy_instance() { # $1: suffix — exit 0 if an old full-copy clone (has Claude-bin)
   [ -e "$CLAUDES_APPS_DIR/Claude ${1}.app/Contents/MacOS/Claude-bin" ]
