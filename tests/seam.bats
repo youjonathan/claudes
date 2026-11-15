@@ -54,12 +54,8 @@ setup() {
   [ "$CLAUDES_POLL$CLAUDES_IDLE_MINUTES$CLAUDES_CPU_SAMPLE$CLAUDES_CPU_IDLE$CLAUDES_STOP_TIMEOUT$CLAUDES_INSTALL_TIMEOUT$CLAUDES_MAX_WAIT$CLAUDES_MARKER_GRACE$CLAUDES_MARKER_MAX_AGE" = 123456789 ]
 }
 
-@test "datadir_running is exact-match and stub bodies fail loudly" {
+@test "datadir_running is false for a folder nothing is running" {
   source "$REPO/lib/common.sh"; source "$REPO/lib/procs.sh"
   run datadir_running "/definitely/not/a/running/dir"
   [ "$status" -eq 1 ]
-  source "$REPO/lib/update.sh"
-  run cmd_update
-  [ "$status" -eq 1 ]
-  [[ "$output" == *"not implemented yet"* ]]
 }
