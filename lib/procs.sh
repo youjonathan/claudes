@@ -1,28 +1,110 @@
 #!/bin/bash
-# lib/procs.sh — process matching via ps (never pgrep/pkill -f patterns). Source, do not execute.
+# lib/procs.sh — process matching via ps, exact string comparison only. Source, do not execute.
 
-# -> lines PID<TAB>DATADIR for every main Claude process under $CLAUDES_APP_SRC (no flag -> $CLAUDES_SUPPORT_DIR/Claude)
-claude_main_procs() { echo "claudes: claude_main_procs not implemented yet" >&2; return 1; }
+_procs_ps() { ps -axo pid=,ppid=,command= 2>/dev/null || true; }   # one snapshot: PID PPID COMMAND
 
-# DATADIR -> main PID for exactly that folder; nothing and status 1 if none
-datadir_main_pid() { echo "claudes: datadir_main_pid not implemented yet" >&2; return 1; }
-
-# DATADIR -> status 0 if a main process runs with that folder, else 1 (temporary exact-match body)
-datadir_running() {
-  local line needle="--user-data-dir=$1" found=1
-  while IFS= read -r line; do
-    case "$line" in
-      *"$needle "*|*"$needle") found=0; break;;
-    esac
-  done < <(ps -axo command= 2>/dev/null)
-  return $found
+# SIG PID... -> signal through the kill found on PATH (the bash builtin cannot be stubbed)
+_procs_signal() {
+  local sig="$1" p; shift
+  for p in "$@"; do env kill "-$sig" "$p" >/dev/null 2>&1 || true; done
 }
 
+# -> lines PID<TAB>DATADIR for every main Claude process under $CLAUDES_APP_SRC (no flag -> $CLAUDES_SUPPORT_DIR/Claude)
+claude_main_procs() {
+  local pid ppid cmd dd bin="$CLAUDES_APP_SRC/Contents/MacOS/Claude"
+  while read -r pid ppid cmd; do
+    case "$cmd" in
+      "$bin"|"$bin "*) ;;
+      *) continue;;
+    esac
+    case "$cmd" in
+      *" --user-data-dir="*) dd="${cmd#*" --user-data-dir="}"; dd="${dd%% --*}";;
+      *) dd="$CLAUDES_SUPPORT_DIR/Claude";;
+    esac
+    printf '%s\t%s\n' "$pid" "$dd"
+  done < <(_procs_ps)
+}
+
+# DATADIR -> main PID for exactly that folder; nothing and status 1 if none
+datadir_main_pid() {
+  local want="$1" pid dd
+  while IFS=$'\t' read -r pid dd; do
+    if [ "$dd" = "$want" ]; then echo "$pid"; return 0; fi
+  done < <(claude_main_procs)
+  return 1
+}
+
+# DATADIR -> status 0 if a main process runs with that folder, else 1
+datadir_running() { datadir_main_pid "$1" >/dev/null; }
+
 # PID -> PID and all descendants (by ppid), one per line
-proc_tree() { echo "claudes: proc_tree not implemented yet" >&2; return 1; }
+proc_tree() {
+  _procs_ps | awk -v root="$1" '
+    { kids[$2] = kids[$2] " " $1 }
+    END {
+      n = 1; q[1] = root; seen[root] = 1
+      for (i = 1; i <= n; i++) {
+        print q[i]
+        m = split(kids[q[i]], a, " ")
+        for (j = 1; j <= m; j++) if (!(a[j] in seen)) { seen[a[j]] = 1; q[++n] = a[j] }
+      }
+    }'
+}
 
 # DATADIR -> pids of chrome_crashpad_handler with --database=DATADIR/Crashpad
-crashpad_pids() { echo "claudes: crashpad_pids not implemented yet" >&2; return 1; }
+crashpad_pids() {
+  local want="--database=$1/Crashpad" pid ppid cmd
+  while read -r pid ppid cmd; do
+    case "$cmd" in *chrome_crashpad_handler*) ;; *) continue;; esac
+    case "$cmd" in
+      *" $want"|*" $want "*) echo "$pid";;
+    esac
+  done < <(_procs_ps)
+}
+
+# MAINPID -> main pid plus its descendants that live inside $CLAUDES_APP_SRC (never Squirrel/ShipIt)
+_procs_owned() {
+  local main="$1" tree pid ppid cmd
+  tree=" $(proc_tree "$main" | tr '\n' ' ')"
+  echo "$main"
+  while read -r pid ppid cmd; do
+    [ "$pid" = "$main" ] && continue
+    case "$tree" in *" $pid "*) ;; *) continue;; esac
+    case "$cmd" in *Squirrel.framework*|*ShipIt*) continue;; esac
+    case "$cmd" in "$CLAUDES_APP_SRC/"*) echo "$pid";; esac
+  done < <(_procs_ps)
+}
+
+# "PIDS" DATADIR -> those pids (plus any crashpad handler for DATADIR) still present in ps, one per line
+_procs_alive() {
+  local tracked=" $1 " dd="$2" pid ppid cmd
+  {
+    while read -r pid ppid cmd; do
+      case "$tracked" in *" $pid "*) echo "$pid";; esac
+    done < <(_procs_ps)
+    crashpad_pids "$dd"
+  } | sort -un
+}
 
 # DATADIR [TIMEOUT] -> SIGTERM then SIGKILL the copy and its Claude-owned tree; 0 when gone, 1 if still alive; never signals ShipIt
-stop_datadir() { echo "claudes: stop_datadir not implemented yet" >&2; return 1; }
+stop_datadir() {
+  local datadir="$1" timeout="${2:-$CLAUDES_STOP_TIMEOUT}" main tracked alive i=0
+  main="$(datadir_main_pid "$datadir")" || return 0
+  tracked="$(_procs_owned "$main" | tr '\n' ' ')"
+  _procs_signal TERM "$main"
+  while :; do
+    alive="$(_procs_alive "$tracked" "$datadir")"
+    [ -z "$alive" ] && return 0
+    [ "$i" -ge "$timeout" ] && break
+    claudes_sleep 1; i=$((i + 1))
+  done
+  # shellcheck disable=SC2086
+  _procs_signal KILL $alive
+  i=0
+  while [ "$i" -lt 10 ]; do
+    claudes_sleep 1; i=$((i + 1))
+    alive="$(_procs_alive "$tracked" "$datadir")"
+    [ -z "$alive" ] && return 0
+  done
+  return 1
+}

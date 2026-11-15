@@ -16,7 +16,7 @@ build_instance() { # suffix hue profile-name
   trap 'rm -rf "$scratch"; trap - RETURN' RETURN
 
   echo ">> [$suffix] quit any running copy + fresh launcher bundle"
-  pkill -f "user-data-dir=$datadir" 2>/dev/null || true
+  stop_datadir "$datadir" || { echo "ERROR: [$suffix] the running copy would not quit; not replacing its launcher"; return 1; }
   rm -rf "$dst"
   mkdir -p "$dst/Contents/MacOS" "$dst/Contents/Resources"
 
@@ -83,22 +83,8 @@ remove_instance() { # suffix profile
   local suffix="$1" profname="${2:-}"
   if [ -n "$profname" ]; then
     local datadir="$HOME/Library/Application Support/$profname"
-    pkill -f "user-data-dir=$datadir" 2>/dev/null || true
-    pkill -f "chrome_crashpad_handler.*database=$datadir/Crashpad" 2>/dev/null || true
-    # best-effort wait for the main process, its helper/renderer/gpu/utility
-    # children, and the crashpad handler to actually exit, so the caller's
-    # rm -rf doesn't race a still-shutting-down process. Empirically, full
-    # teardown of a real instance (main + gpu-process + network/node utility
-    # + renderer helpers) can take 8-12s in practice, so this caps at ~20s
-    # rather than the ~2s that proved too short in testing; it still returns
-    # early as soon as everything is gone, and proceeds regardless once the
-    # cap elapses (best-effort, not a hard requirement).
-    local waited=0
-    while [ "$waited" -lt 200 ] && { pgrep -f "user-data-dir=$datadir" >/dev/null 2>&1 || \
-      pgrep -f "chrome_crashpad_handler.*database=$datadir/Crashpad" >/dev/null 2>&1; }; do
-      sleep 0.1
-      waited=$((waited + 1))
-    done
+    # waits for the main process, its tree and the crashpad handler to exit
+    stop_datadir "$datadir" || echo "WARN: a copy using $datadir would not quit"
   fi
   rm -rf "$CLAUDES_APPS_DIR/Claude ${suffix}.app"
   echo "removed app: Claude ${suffix}.app"
