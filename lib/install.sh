@@ -101,12 +101,12 @@ install_via_shipit() {
   start="$(_install_now)"
   while :; do
     text="$(shipit_log_since "$offset")"
-    if printf '%s\n' "$text" | grep -q 'Installation completed successfully' \
+    if grep -q 'Installation completed successfully' <<<"$text" \
        && [ "$(_install_app_build "$CLAUDES_APP_SRC" || true)" = "$want" ]; then
       ok=1; break
     fi
-    if printf '%s\n' "$text" | grep -Eq 'Aborting update attempt|Installation cancelled|Installation error|Too many attempts|downgrade'; then
-      reason="$(printf '%s\n' "$text" | grep -E 'Aborting update attempt|Installation cancelled|Installation error|Too many attempts|downgrade' | head -n 5)"
+    if grep -Eq 'Aborting update attempt|Installation cancelled|Installation error|Too many attempts|downgrade' <<<"$text"; then
+      reason="$(grep -E 'Aborting update attempt|Installation cancelled|Installation error|Too many attempts|downgrade' <<<"$text" | head -n 5)"
       break
     fi
     now="$(_install_now)"
