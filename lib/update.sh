@@ -53,12 +53,14 @@ _update_pending_offset() {
   awk -F'\t' '$1 == "#offset" { print $2; exit }' "$pf"
 }
 
-# OFFSET -> status 0 when the ShipIt log since OFFSET shows "Beginning installation" with no completion or failure after it
+# OFFSET -> status 0 when the ShipIt log since OFFSET shows "Beginning installation" with no completion or failure
+# after it AND the ShipIt job is still running (a job that died mid-install counts as a failed install)
 _update_install_started() {
   shipit_log_since "$1" 2>/dev/null | awk '
     /Beginning installation/ { b = 1; next }
     /Installation completed successfully|Installation cancelled|Installation error|Aborting update attempt|Too many attempts/ { b = 0 }
-    END { exit !b }'
+    END { exit !b }' || return 1
+  shipit_waiting
 }
 
 # -> status 0 when the install that followed the quit recorded in reopen-pending may still be running
@@ -299,6 +301,7 @@ _update_run() {
     return 1
   fi
   echo "Claude updated: $(_update_ver "$UPDATE_OLD_VERSION" "$UPDATE_OLD_BUILD") -> $(_update_ver "$(main_version 2>/dev/null || true)" "$(installed_build 2>/dev/null || true)")"
+  if [ "$UPDATE_WATCH" = 0 ]; then update_safety_net; fi
   return "$reopen_rc"
 }
 
@@ -326,7 +329,7 @@ _update_print_accounts() {
   while IFS=$'\t' read -r d l; do
     [ -n "$d" ] || continue
     n="$(update_account_name "$d" "$l")"
-    line="$(printf '%s\n' "$busy" | grep -F -- "$n is busy" | head -n 1 || true)"
+    line="$(grep -F -- "$n is busy" <<<"$busy" | head -n 1 || true)"
     if [ -n "$line" ]; then echo "  $line"; else echo "  $n: idle"; fi
   done <<EOF
 $UPDATE_ACCOUNTS
@@ -396,7 +399,7 @@ update_staged_age() {
 }
 
 # -> lines DATADIR<TAB>LAUNCHER for running accounts plus accounts down with an update marker.
-#    While an update is waiting, any marker newer than that update counts: that account closed itself for it.
+#    While an update is waiting, a marker counts up to the age of the update itself (or the normal limit, whichever is larger).
 update_open_accounts() {
   local nl seen pid d l age limit staged_age
   nl=$'\n'; seen="$nl"
@@ -418,7 +421,8 @@ update_open_accounts() {
     if [ "$UPDATE_WAITING" = 1 ]; then
       # while an update waits, any marker newer than that update counts, however old
       staged_age="$(update_staged_age 2>/dev/null || true)"
-      case "$staged_age" in ''|*[!0-9]*) ;; *) limit="$staged_age";; esac
+      # the plist is rewritten by every copy's download, so it can look newer than a real self-quit
+      case "$staged_age" in ''|*[!0-9]*) ;; *) [ "$staged_age" -le "$limit" ] || limit="$staged_age";; esac
     fi
     [ "$age" -le "$limit" ] || continue
     seen="$seen$d$nl"
@@ -480,7 +484,7 @@ EOF
 
 # -> write reopen-pending, record build and log offset, stop every open account together; status 1 if any copy is still running
 update_quit_all() {
-  local pf tmp i=0 d l n fail=0 kept="" rc
+  local pf tmp i=0 d l n fail=0 kept="" rc pids="" p running
   pf="$(update_pending_file)"
   UPDATE_OLD_BUILD="$(installed_build 2>/dev/null || true)"
   UPDATE_OLD_VERSION="$(main_version 2>/dev/null || true)"
@@ -496,11 +500,22 @@ update_quit_all() {
   while IFS=$'\t' read -r d l; do
     [ -n "$d" ] || continue
     i=$((i + 1))
-    ( if stop_datadir "$d" "$CLAUDES_STOP_TIMEOUT"; then echo 0; else echo 1; fi > "$tmp/$i.rc" ) </dev/null &
+    ( trap '' HUP   # closing the Terminal must not cut a shutdown short
+      if stop_datadir "$d" "$CLAUDES_STOP_TIMEOUT"; then echo 0; else echo 1; fi > "$tmp/$i.rc" ) </dev/null &
+    pids="$pids $!"
   done <<EOF
 $UPDATE_ACCOUNTS
 EOF
-  wait
+  # wait until every stopper has really exited (a plain `wait` returns early when a signal arrives)
+  while :; do
+    running=0
+    for p in $pids; do
+      if kill -0 "$p" 2>/dev/null; then running=1; fi
+    done
+    [ "$running" = 1 ] || break
+    claudes_sleep 1
+  done
+  wait 2>/dev/null || true
   i=0
   while IFS=$'\t' read -r d l; do
     [ -n "$d" ] || continue
@@ -532,14 +547,12 @@ update_wait_install() {
   while :; do
     build="$(installed_build 2>/dev/null || true)"
     log="$(shipit_log_since "$UPDATE_LOG_OFFSET" 2>/dev/null || true)"
-    if printf '%s\n' "$log" | grep -q 'Installation completed successfully'; then
-      return 0
-    fi
+    case "$log" in *'Installation completed successfully'*) return 0;; esac
     # a changed build alone is not enough: the installer may still be copying files
     if [ -n "$build" ] && [ "$build" != "$UPDATE_OLD_BUILD" ] && ! shipit_waiting; then
       return 0
     fi
-    hits="$(printf '%s\n' "$log" | grep -E 'Aborting update attempt|Installation cancelled|Installation error|Too many attempts' || true)"
+    hits="$(grep -E 'Aborting update attempt|Installation cancelled|Installation error|Too many attempts' <<<"$log" || true)"
     if [ -n "$hits" ]; then
       echo "Claude's installer failed. Its log says:"
       printf '%s\n' "$hits" | sed 's/^/  /'
@@ -562,12 +575,13 @@ update_wait_install() {
 
 # -> stop the plain copy ShipIt relaunches when it is not wanted; status 0
 update_close_plain_relaunch() {
-  local def="$CLAUDES_SUPPORT_DIR/Claude" waited=0 seen_at="" d l in_pending=0 launcher=""
+  local def="$CLAUDES_SUPPORT_DIR/Claude" waited=0 seen_at="" d l in_pending=0 launcher="" log
   # wait for the plain copy: up to 10 more seconds after the installer says it launched Claude
   while [ "$waited" -lt 30 ]; do
     if datadir_running "$def"; then break; fi
-    if [ -z "$seen_at" ] && shipit_log_since "$UPDATE_LOG_OFFSET" 2>/dev/null | grep -q 'Successfully launched application'; then
-      seen_at="$waited"
+    if [ -z "$seen_at" ]; then
+      log="$(shipit_log_since "$UPDATE_LOG_OFFSET" 2>/dev/null || true)"
+      case "$log" in *'Successfully launched application'*) seen_at="$waited";; esac
     fi
     if [ -n "$seen_at" ] && [ $((waited - seen_at)) -ge 10 ]; then break; fi
     if [ -z "$seen_at" ] && [ "$waited" -ge 20 ]; then break; fi

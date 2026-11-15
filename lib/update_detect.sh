@@ -29,7 +29,7 @@ installed_build() {
 shipit_waiting() {
   local out
   out="$(launchctl print "gui/$(id -u)/$_SHIPIT_LABEL" 2>/dev/null)" || return 1
-  printf '%s\n' "$out" | grep -Eq '^[[:space:]]+state = running[[:space:]]*$'
+  grep -Eq '^[[:space:]]+state = running[[:space:]]*$' <<<"$out"
 }
 
 # -> path of staged bundle from updateBundleURL in ShipItState.plist, only if the folder exists

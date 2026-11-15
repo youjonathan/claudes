@@ -705,3 +705,90 @@ hup_sleep() {   # fake sleep: the first time after the accounts are stopped, sen
   run cmd_update
   [ "$(events | grep -c '^open ')" = 1 ]
 }
+
+# ---- third review round ----
+
+@test "R3-1a. (reviewer repro) a marker older than the plist but within the normal age limit is kept" {
+  echo 600 > "$W/staged_age"              # another copy's later download rewrote the plist 10 minutes ago
+  run_up Claude-3p
+  set_marker Claude-Acct-D update 10800   # D quit itself 3 hours ago
+  run cmd_update
+  [ "$status" -eq 0 ]
+  [ -e "$W/running.d/Claude-Acct-D" ]
+}
+
+@test "R3-1b. after a successful manual run the safety net runs" {
+  run_up Claude
+  set_marker Claude-E update 400
+  printf '%s\t%s\n' "$A" "$W/Apps/Claude A.app" "$E" "$W/Apps/Claude E.app" > "$W/accounts"
+  marker_says_update_quit() { [ "$(basename "$1")" != Claude-E ] || [ -e "$W/installed" ]; }   # E's marker only appears after the install
+  update_state() { if [ -e "$W/installed" ]; then echo none; else echo waiting; fi; }
+  run cmd_update
+  [ "$status" -eq 0 ]
+  [ "$(events | grep '^open ')" = "open $W/Apps/Claude A.app
+open $W/Apps/Claude E.app" ]
+}
+
+@test "R3-1c. the safety net does not run at the end of a watch-run" {
+  run_up Claude
+  set_marker Claude-E update 400
+  printf '%s\t%s\n' "$A" "$W/Apps/Claude A.app" "$E" "$W/Apps/Claude E.app" > "$W/accounts"
+  marker_says_update_quit() { [ "$(basename "$1")" != Claude-E ] || [ -e "$W/installed" ]; }   # E's marker only appears after the install
+  update_state() { if [ -e "$W/installed" ]; then echo none; else echo waiting; fi; }
+  echo 700 > "$W/useridle"
+  run cmd_update --watch-run
+  [ "$(events | grep -c "Claude E.app")" = 0 ]
+}
+
+@test "R3-2. HUP during the quit phase: the slow account is still waited for and everything is reopened" {
+  export CLAUDES_LOG_DIR="$W/logs"
+  run_up Claude Claude-3p
+  stop_datadir() {
+    echo "stop $1" >> "$W/events"
+    if [ "$(basename "$1")" = Claude-3p ]; then
+      bash -c 'echo $PPID' > "$W/me"
+      kill -HUP "$(cat "$W/me")" "$(cat "$W/mainpid")"    # the Terminal closes: this stopper and the main script both get HUP
+      sleep 1                                             # ... while this copy is still shutting down
+    fi
+    rm -f "$W/running.d/$(basename "$1")"; touch "$W/stopped"; return 0
+  }
+  clean_run 'echo $$ > "$W/mainpid"; cmd_update' > /dev/null 2>&1 || true
+  [ "$(events | grep '^open ')" = "open $W/Apps/Claude A.app
+open $W/Apps/Claude C.app" ]
+  ! grep -q "would not quit" "$CLAUDES_LOG_DIR/update.log"
+  [ ! -e "$CLAUDES_STATE_DIR/reopen-pending" ]
+  # reopening happened after the install, i.e. after both stops
+  [ "$(events | grep -n '^open ' | head -1 | cut -d: -f1)" -gt "$(events | grep -n '^stop ' | tail -1 | cut -d: -f1)" ]
+}
+
+@test "R3-3a. a log of more than 200 KB still gives 'completed successfully'" {
+  UPDATE_OLD_BUILD=100; UPDATE_LOG_OFFSET=0
+  { awk 'BEGIN { for (i = 1; i <= 6000; i++) printf "ShipIt line %d with some padding to fill the log up nicely\n", i }'
+    echo "Installation completed successfully"; } > "$W/log"
+  [ "$(wc -c < "$W/log" | tr -d ' ')" -gt 200000 ]
+  run update_wait_install
+  [ "$status" -eq 0 ]
+}
+
+@test "R3-3b. a long log with a failure line is still reported" {
+  UPDATE_OLD_BUILD=100; UPDATE_LOG_OFFSET=0
+  { awk 'BEGIN { for (i = 1; i <= 6000; i++) printf "ShipIt line %d with some padding to fill the log up nicely\n", i }'
+    echo "Installation cancelled: App Still Running Error"; } > "$W/log"
+  run update_wait_install
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Installation cancelled"* ]]
+}
+
+@test "R3-3c. no printf-into-grep -q pipelines remain in lib/" {
+  ! grep -nE "printf .*\| *grep -[a-zA-Z]*q|\| *grep -[a-zA-Z]*q" "$REPO"/lib/*.sh
+}
+
+@test "R3-4. install started but the ShipIt job is gone (crashed): recovery reopens" {
+  echo none > "$W/state_word"                     # shipit_waiting is false: no shipit_running file
+  echo "Beginning installation" > "$W/log"
+  _update_pending_write "$A"$'\t'"$W/Apps/Claude A.app" "" "" 0
+  run cmd_update
+  [ "$status" -eq 0 ]
+  [ "$(events | grep '^open ')" = "open $W/Apps/Claude A.app" ]
+  [ ! -e "$CLAUDES_STATE_DIR/reopen-pending" ]
+}
