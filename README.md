@@ -88,11 +88,15 @@ whether it is running, and `claudes watch off` removes it. Its log is
 `~/Library/Logs/claudes/update-watcher.log` (cut to its last 2000 lines once it passes 1 MB).
 If an account does not come back after a reopen, the helper shows a macOS notification.
 
-The helper also has a safety net for an account that closed itself for an update and was never
-reopened. It reopens such an account only when the install did **not** happen: no update is
-waiting any more, or Claude's installer is not waiting, and the account has stayed closed for
-5 minutes (and less than 12 hours). While the update is still waiting and other accounts are
-busy, that account simply stays closed; when the update installs, it is reopened with the others.
+The helper also has a safety net. An account that closed itself for an update is reopened once
+no update is waiting any more and Claude's installer isn't running. That is what happens after
+Claude installed and reopened only a plain Claude, or when the update went away. It only
+applies to an account that has stayed closed for 5 minutes (and less than 12 hours). While
+an update is still waiting and other accounts are busy, that account stays closed; when the
+update installs, it is reopened together with the others.
+
+If you close the Terminal during a run, the run carries on without it and writes its messages to
+`~/Library/Logs/claudes/update.log`.
 
 ### What counts as idle
 
@@ -110,7 +114,8 @@ minutes (the same `CLAUDES_IDLE_MINUTES`). If it can't read that, it waits. A ma
 Other settings, all environment variables: `CLAUDES_POLL` (seconds between idle re-checks, 60),
 `CLAUDES_MAX_WAIT` (how long a manual run waits for busy accounts before giving up, 14400),
 `CLAUDES_STOP_TIMEOUT`, `CLAUDES_INSTALL_TIMEOUT`, `CLAUDES_MARKER_GRACE`,
-`CLAUDES_MARKER_MAX_AGE`.
+`CLAUDES_MARKER_MAX_AGE` (how old an update-quit marker may be, 43200), `CLAUDES_PENDING_MAX_AGE`
+(how old a `reopen-pending` list may be before it is ignored, 86400).
 
 ### Where it keeps its notes
 

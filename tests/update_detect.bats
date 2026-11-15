@@ -411,3 +411,13 @@ TABLE
   run user_idle_seconds
   [ "$status" -eq 1 ]
 }
+
+@test "account_idle: Cowork files under skills-plugin do not make it busy" {
+  stub_ps
+  printf '100\t%s\n' "$(DD)" > "$T/mainprocs"
+  mkdir -p "$(DD)/local-agent-mode-sessions/skills-plugin/x"
+  touch "$(DD)/local-agent-mode-sessions/skills-plugin/x/SKILL.md"
+  printf '100 1 0:10.00 %s/Contents/MacOS/Claude\n' "$CLAUDES_APP_SRC" > "$T/procs"
+  run account_idle "$(DD)"
+  [ "$status" -eq 0 ]
+}

@@ -86,39 +86,53 @@ EOF
   return 1
 }
 
-# "PIDS" -> lines PID<TAB>COMMAND for those pids as they are now
+# -> seconds since the epoch; wrapper so tests can fake the clock
+claudes_now() { date +%s; }
+
+# "PIDS" -> lines PID<TAB>COMMAND for those pids as they are now (one pass over one ps snapshot)
 _procs_record() {
-  local tracked=" $1 " pid ppid cmd
-  while read -r pid ppid cmd; do
-    case "$tracked" in *" $pid "*) printf '%s\t%s\n' "$pid" "$cmd";; esac
-  done < <(_procs_ps)
+  _procs_ps | TRACKED=" $1 " awk '
+    BEGIN { tracked = ENVIRON["TRACKED"] }
+    { pid = $1; line = $0
+      sub(/^[ \t]+/, "", line); sub(/^[^ \t]+[ \t]+[^ \t]+[ \t]*/, "", line); sub(/[ \t]+$/, "", line)
+      if (index(tracked, " " pid " ")) printf "%s\t%s\n", pid, line }'
+}
+
+# RECORDED PID -> the command line recorded for PID (RECORDED = lines PID<TAB>COMMAND); status 1 if PID is not recorded
+_procs_recorded_cmd() {
+  printf '%s\n' "$1" | awk -F'\t' -v p="$2" '
+    $1 == p { sub(/^[^\t]*\t/, ""); printf "%s", $0; found = 1; exit }
+    END { exit !found }'
 }
 
 # RECORDED DATADIR -> recorded pids still running with the SAME command line (a reused pid is not ours),
-# plus any crashpad handler for DATADIR, one per line
+# plus any crashpad handler for DATADIR, one per line. One awk pass: the recorded list is loaded once.
 _procs_alive() {
-  local rec="$1" dd="$2" pid ppid cmd want
+  local rec="$1" dd="$2"
   {
-    while read -r pid ppid cmd; do
-      want="$(_procs_recorded_cmd "$rec" "$pid")" || continue
-      if [ "$want" = "$cmd" ]; then echo "$pid"; fi
-    done < <(_procs_ps)
+    _procs_ps | REC="$rec" awk '
+      BEGIN { n = split(ENVIRON["REC"], L, "\n")
+              for (i = 1; i <= n; i++) { t = index(L[i], "\t"); if (t) want[substr(L[i], 1, t - 1)] = substr(L[i], t + 1) } }
+      { pid = $1; line = $0
+        sub(/^[ \t]+/, "", line); sub(/^[^ \t]+[ \t]+[^ \t]+[ \t]*/, "", line); sub(/[ \t]+$/, "", line)
+        if ((pid in want) && want[pid] == line) print pid }'
     crashpad_pids "$dd"
   } | sort -un
 }
 
 # DATADIR [TIMEOUT] -> SIGTERM then SIGKILL the copy and its Claude-owned tree; 0 when gone, 1 if still alive; never signals ShipIt
 stop_datadir() {
-  local datadir="$1" timeout="${2:-$CLAUDES_STOP_TIMEOUT}" main tracked rec alive killable p now want i=0
+  local datadir="$1" timeout="${2:-$CLAUDES_STOP_TIMEOUT}" main tracked rec alive killable p now want t0
   main="$(datadir_main_pid "$datadir")" || return 0
   tracked="$(_procs_owned "$main" | tr '\n' ' ')"
   rec="$(_procs_record "$tracked")"
   _procs_signal TERM "$main"
+  t0="$(claudes_now)"
   while :; do
     alive="$(_procs_alive "$rec" "$datadir")"
     [ -z "$alive" ] && return 0
-    [ "$i" -ge "$timeout" ] && break
-    claudes_sleep 1; i=$((i + 1))
+    [ $(( $(claudes_now) - t0 )) -ge "$timeout" ] && break
+    claudes_sleep 1
   done
   # only kill a pid that still has the command line recorded at the start (pids get reused)
   killable=""
@@ -131,9 +145,9 @@ stop_datadir() {
   done
   # shellcheck disable=SC2086
   [ -z "$killable" ] || _procs_signal KILL $killable
-  i=0
-  while [ "$i" -lt 10 ]; do
-    claudes_sleep 1; i=$((i + 1))
+  t0="$(claudes_now)"
+  while [ $(( $(claudes_now) - t0 )) -lt 10 ]; do
+    claudes_sleep 1
     alive="$(_procs_alive "$rec" "$datadir")"
     [ -z "$alive" ] && return 0
   done

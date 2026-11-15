@@ -13,7 +13,6 @@ UPDATE_NOTBACK=""          # lines DATADIR<TAB>LAUNCHER of accounts that did not
 CLAUDES_PENDING_MAX_AGE="${CLAUDES_PENDING_MAX_AGE:-86400}"   # reopen-pending older than this is ignored
 
 claudes_open() { open "$@"; }   # every open goes through here so tests can replace it
-claudes_now() { date +%s; }     # seconds since the epoch; tests replace it
 claudes_notify() {              # TEXT -> macOS notification; tests replace it
   local t; t="$(printf '%s' "$1" | tr -d '"\\')"
   osascript -e "display notification \"$t\" with title \"claudes\"" >/dev/null 2>&1 || true
@@ -21,7 +20,7 @@ claudes_notify() {              # TEXT -> macOS notification; tests replace it
 
 update_pending_file() { echo "$CLAUDES_STATE_DIR/reopen-pending"; }
 
-# reopen-pending: first line "#ts<TAB>EPOCH", then one "DATADIR<TAB>LAUNCHER" per closed account,
+# reopen-pending: header "#ts<TAB>EPOCH" and "#offset<TAB>BYTES" (ShipIt log size when we quit), then one "DATADIR<TAB>LAUNCHER" per closed account,
 # then optional "#tries<TAB>DATADIR<TAB>N" lines (how many reopen attempts failed)
 
 # -> epoch seconds written in reopen-pending, empty if none
@@ -47,6 +46,30 @@ update_pending_accounts() {
   grep -v '^#' "$pf" | sed '/^$/d' || true
 }
 
+# -> ShipIt log size recorded in reopen-pending, empty if none
+_update_pending_offset() {
+  local pf; pf="$(update_pending_file)"
+  [ -f "$pf" ] || return 0
+  awk -F'\t' '$1 == "#offset" { print $2; exit }' "$pf"
+}
+
+# OFFSET -> status 0 when the ShipIt log since OFFSET shows "Beginning installation" with no completion or failure after it
+_update_install_started() {
+  shipit_log_since "$1" 2>/dev/null | awk '
+    /Beginning installation/ { b = 1; next }
+    /Installation completed successfully|Installation cancelled|Installation error|Aborting update attempt|Too many attempts/ { b = 0 }
+    END { exit !b }'
+}
+
+# -> status 0 when the install that followed the quit recorded in reopen-pending may still be running
+_update_pending_mid_install() {
+  local off; off="$(_update_pending_offset)"
+  case "$off" in
+    ''|*[!0-9]*) shipit_waiting;;   # an older list without a log offset: fall back to the job state
+    *) _update_install_started "$off";;
+  esac
+}
+
 # DATADIR -> failed reopen attempts recorded for it (0 if none)
 _update_pending_tries() {
   local pf n; pf="$(update_pending_file)"
@@ -55,12 +78,13 @@ _update_pending_tries() {
   echo "${n:-0}"
 }
 
-# ACCOUNTLINES [TS] [TRIESLINES] -> write reopen-pending (atomically)
+# ACCOUNTLINES [TS] [TRIESLINES] [LOGOFFSET] -> write reopen-pending (atomically)
 _update_pending_write() {
   local pf ts="${2:-}"; pf="$(update_pending_file)"
   [ -n "$ts" ] || ts="$(claudes_now)"
   mkdir -p "$CLAUDES_STATE_DIR"
   { printf '#ts\t%s\n' "$ts"
+    if [ -n "${4:-}" ]; then printf '#offset\t%s\n' "$4"; fi
     printf '%s\n' "$1" | sed '/^$/d'
     if [ -n "${3:-}" ]; then printf '%s\n' "$3" | sed '/^$/d'; fi
   } > "$pf.tmp"
@@ -109,20 +133,31 @@ _update_trim_log() {
   return 0
 }
 
-# on INT/TERM/HUP after accounts started quitting: put things back, or say who will
+# TEXT... -> print, never failing (the terminal may be gone)
+_update_say() { echo "$@" 2>/dev/null || true; }
+
+# on INT/TERM after accounts started quitting: put things back, or say who will
 _update_on_interrupt() {
+  set +e
   trap - INT TERM HUP
-  echo
-  echo "Interrupted."
-  if shipit_waiting; then
-    echo "Claude's installer is running. The next 'claudes update' (or the background helper) will reopen your accounts."
-    echo "They are listed in $(update_pending_file)."
+  _update_say
+  _update_say "Interrupted."
+  if _update_install_started "$UPDATE_LOG_OFFSET"; then
+    _update_say "Claude's installer is running. The next 'claudes update' (or the background helper) will reopen your accounts."
+    _update_say "They are listed in $(update_pending_file)."
   else
-    echo "Reopening the accounts that were closed."
+    _update_say "Reopening the accounts that were closed."
     update_reopen_accounts || true
   fi
   update_unlock
   exit 1
+}
+
+# on HUP (the Terminal was closed): do not stop half way; keep going and write to a log instead
+_update_on_hup() {
+  mkdir -p "$CLAUDES_LOG_DIR" 2>/dev/null || true
+  exec >> "$CLAUDES_LOG_DIR/update.log" 2>&1 || true
+  _update_say "The Terminal was closed. Carrying on with the update; this output goes to $CLAUDES_LOG_DIR/update.log."
 }
 
 # [--dry-run] [--watch-run] -> install a waiting Claude update and reopen accounts; exit status 0/1
@@ -158,13 +193,15 @@ cmd_update() {
     return "$rc"
   fi
 
+  trap '' PIPE   # a vanished Terminal must not kill the run half way
   if [ "$watch" = 1 ]; then _update_trim_log; fi
   if ! update_lock; then
     echo "Another claudes update is already in progress, so this one is stopping. Nothing was changed."
+    trap - PIPE
     return 0
   fi
   _update_run || rc=$?
-  trap - INT TERM HUP
+  trap - INT TERM HUP PIPE
   update_unlock
   return "$rc"
 }
@@ -177,7 +214,7 @@ _update_run() {
 
   # a previous run that was interrupted leaves its list of accounts behind
   pending="$(update_pending_accounts)"
-  if [ -n "$pending" ] && [ "$state" != waiting ] && ! shipit_waiting; then
+  if [ -n "$pending" ] && [ "$state" != waiting ] && ! _update_pending_mid_install; then
     names="$(update_names_of "$pending")"
     if [ "$UPDATE_DRY" = 1 ]; then
       echo "A previous update run was interrupted. It would reopen: $names"
@@ -350,10 +387,18 @@ doctor_update_report() {
   return 0
 }
 
+# -> seconds since ShipItState.plist was written (the waiting update); status 1 if it is missing
+update_staged_age() {
+  local f="$CLAUDES_SHIPIT_DIR/ShipItState.plist" m
+  [ -f "$f" ] || return 1
+  m="$(stat -f %m "$f")" || return 1
+  echo $(( $(date +%s) - m ))
+}
+
 # -> lines DATADIR<TAB>LAUNCHER for running accounts plus accounts down with an update marker.
-#    While an update is waiting, a marker of any age counts: that account closed itself for this update.
+#    While an update is waiting, any marker newer than that update counts: that account closed itself for it.
 update_open_accounts() {
-  local nl seen pid d l age
+  local nl seen pid d l age limit staged_age
   nl=$'\n'; seen="$nl"
   while IFS=$'\t' read -r pid d; do
     [ -n "$d" ] || continue
@@ -367,11 +412,15 @@ update_open_accounts() {
     case "$seen" in *"$nl$d$nl"*) continue;; esac
     if datadir_running "$d"; then continue; fi
     marker_says_update_quit "$d" || continue
-    if [ "$UPDATE_WAITING" != 1 ]; then
-      age="$(marker_age "$d" 2>/dev/null || true)"
-      case "$age" in ''|*[!0-9]*) continue;; esac
-      [ "$age" -le "$CLAUDES_MARKER_MAX_AGE" ] || continue
+    age="$(marker_age "$d" 2>/dev/null || true)"
+    case "$age" in ''|*[!0-9]*) continue;; esac
+    limit="$CLAUDES_MARKER_MAX_AGE"
+    if [ "$UPDATE_WAITING" = 1 ]; then
+      # while an update waits, any marker newer than that update counts, however old
+      staged_age="$(update_staged_age 2>/dev/null || true)"
+      case "$staged_age" in ''|*[!0-9]*) ;; *) limit="$staged_age";; esac
     fi
+    [ "$age" -le "$limit" ] || continue
     seen="$seen$d$nl"
     printf '%s\t%s\n' "$d" "$l"
   done < <(known_accounts 2>/dev/null || true)
@@ -433,12 +482,14 @@ EOF
 update_quit_all() {
   local pf tmp i=0 d l n fail=0 kept="" rc
   pf="$(update_pending_file)"
-  _update_pending_write "$UPDATE_ACCOUNTS"
-  trap '_update_on_interrupt' INT TERM HUP
   UPDATE_OLD_BUILD="$(installed_build 2>/dev/null || true)"
   UPDATE_OLD_VERSION="$(main_version 2>/dev/null || true)"
   UPDATE_LOG_OFFSET="$(shipit_log_size 2>/dev/null || echo 0)"
   case "$UPDATE_LOG_OFFSET" in ''|*[!0-9]*) UPDATE_LOG_OFFSET=0;; esac
+  _update_pending_write "$UPDATE_ACCOUNTS" "" "" "$UPDATE_LOG_OFFSET"
+  trap '_update_on_interrupt' INT TERM
+  trap '_update_on_hup' HUP
+  trap '' PIPE
 
   [ -z "$UPDATE_ACCOUNTS" ] || echo "Quitting together: $(update_names_of "$UPDATE_ACCOUNTS")"
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/claudes-stop.XXXXXX")"
@@ -469,7 +520,7 @@ $UPDATE_ACCOUNTS
 EOF
   rm -rf "$tmp"
   if [ "$fail" = 1 ]; then
-    _update_pending_write "$kept" "$(_update_pending_ts)"   # every account that did close stays listed until it is back
+    _update_pending_write "$kept" "$(_update_pending_ts)" "" "$UPDATE_LOG_OFFSET"   # every account that did close stays listed until it is back
   fi
   return "$fail"
 }
@@ -589,12 +640,12 @@ _update_reopen_file() {
 # -> reopen every account in reopen-pending and confirm each is running; status 1 if any did not come up.
 #    Accounts that did not come up stay in reopen-pending (3 tries, then dropped).
 update_reopen_accounts() {
-  local pf accounts tmp d l t keep="" tries_lines="" ts
+  local pf accounts tmp d l t keep="" tries_lines="" ts off
   pf="$(update_pending_file)"
   [ -f "$pf" ] || return 0
   accounts="$(update_pending_accounts)"
   if [ -z "$accounts" ]; then rm -f "$pf"; return 0; fi
-  ts="$(_update_pending_ts)"
+  ts="$(_update_pending_ts)"; off="$(_update_pending_offset)"
   tmp="$(mktemp "$CLAUDES_STATE_DIR/reopen-list.XXXXXX")"
   printf '%s\n' "$accounts" > "$tmp"
   _update_reopen_file "$tmp" || true
@@ -614,7 +665,7 @@ update_reopen_accounts() {
 $UPDATE_NOTBACK
 EOF
   if [ -n "$keep" ]; then
-    _update_pending_write "$keep" "$ts" "$tries_lines"
+    _update_pending_write "$keep" "$ts" "$tries_lines" "$off"
     echo "Kept it on the list; the next claudes update will try again."
   else
     rm -f "$pf"

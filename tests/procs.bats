@@ -38,7 +38,9 @@ STUB
   PATH="$BATS_TEST_TMPDIR/bin:$PATH"
 
   source "$REPO/lib/common.sh"; source "$REPO/lib/procs.sh"
-  claudes_sleep() { :; }
+  CLK="$BATS_TEST_TMPDIR/clock"; echo 1000 > "$CLK"
+  claudes_now() { cat "$CLK"; }                                  # fake clock: only sleeping moves it
+  claudes_sleep() { echo $(( $(cat "$CLK") + 1 )) > "$CLK"; }
   set -euo pipefail   # the real script runs this way
 }
 
@@ -206,7 +208,7 @@ stopfix() {
   stopfix
   echo 100 >> "$STUCK"
   SLEEPS_BEFORE_KILL=0
-  claudes_sleep() { grep -q '^KILL' "$KILLLOG" || SLEEPS_BEFORE_KILL=$((SLEEPS_BEFORE_KILL + 1)); }
+  claudes_sleep() { echo $(( $(cat "$CLK") + 1 )) > "$CLK"; grep -q '^KILL' "$KILLLOG" || SLEEPS_BEFORE_KILL=$((SLEEPS_BEFORE_KILL + 1)); }
   stop_datadir "$SUP/Work" 3
   [ "$SLEEPS_BEFORE_KILL" -eq 3 ]
 }
@@ -240,7 +242,7 @@ stopfix() {
 
 @test "stop_datadir works under set -euo pipefail with a default timeout" {
   stopfix
-  run bash -c 'set -euo pipefail; source "$1/lib/common.sh"; source "$1/lib/procs.sh"; claudes_sleep() { :; }
+  run bash -c 'set -euo pipefail; source "$1/lib/common.sh"; source "$1/lib/procs.sh"; claudes_sleep() { :; }; claudes_now() { echo $((++N)); }; N=0
     stop_datadir "$2/Work"; echo done' _ "$REPO" "$SUP"
   [ "$status" -eq 0 ]
   [ "$output" = done ]
@@ -255,9 +257,30 @@ stopfix() {
   : > "$CASCADE"
   echo 101 >> "$STUCK"           # helper ignores TERM
   claudes_sleep() {              # while we wait, pid 101 exits and the number is reused by another program
+    echo $(( $(cat "$CLK") + 1 )) > "$CLK"
     sed -i.bak 's|^ *101 .*|101 1 /usr/bin/some-other-program --unrelated|' "$PSFIX"
   }
   run stop_datadir "$SUP/Work" 2
   [ "$status" -eq 0 ]
   ! grep -q '^KILL 101$' "$KILLLOG"
+}
+
+@test "stop_datadir timeout is measured with the clock, not by counting sleeps" {
+  stopfix
+  echo 100 >> "$STUCK"
+  SLEEPS_BEFORE_KILL=0
+  claudes_sleep() { echo $(( $(cat "$CLK") + 5 )) > "$CLK"; grep -q '^KILL' "$KILLLOG" || SLEEPS_BEFORE_KILL=$((SLEEPS_BEFORE_KILL + 1)); }
+  stop_datadir "$SUP/Work" 10
+  [ "$SLEEPS_BEFORE_KILL" -eq 2 ]
+}
+
+@test "_procs_alive checks a long recorded list in one pass, quickly" {
+  stopfix
+  rec=""
+  for i in $(seq 1000 1800); do rec="$rec$i"$'\t'"/some/command $i"$'\n'; done
+  rec="${rec}100"$'\t'"$APP/Contents/MacOS/Claude --user-data-dir=$SUP/Work"
+  start=$SECONDS
+  run _procs_alive "$rec" "$SUP/Work"
+  [ $((SECONDS - start)) -lt 2 ]
+  [[ "$output" == *"100"* ]]
 }

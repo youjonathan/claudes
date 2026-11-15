@@ -12,7 +12,7 @@ setup() {
 
   SUP="$CLAUDES_SUPPORT_DIR"
   A="$SUP/Claude"; C="$SUP/Claude-3p"; D="$SUP/Claude-Acct-D"; E="$SUP/Claude-E"
-  : > "$W/events"; : > "$W/sleeps"; : > "$W/log"; echo 1000000 > "$W/clock"
+  : > "$W/events"; : > "$W/sleeps"; : > "$W/log"; echo 1000000 > "$W/clock"; echo 100000 > "$W/staged_age"
   echo 100 > "$W/build"
   echo waiting > "$W/state_word"
   echo success > "$W/mode"
@@ -76,6 +76,7 @@ setup() {
   claudes_sleep() { echo "$1" >> "$W/sleeps"; echo $(( $(cat "$W/clock") + ${CLOCK_STEP:-$1} )) > "$W/clock"; }
   claudes_now() { cat "$W/clock"; }
   claudes_notify() { echo "$*" >> "$W/notes"; }
+  update_staged_age() { cat "$W/staged_age" 2>/dev/null || return 1; }
   shipit_waiting() { [ -e "$W/shipit_running" ]; }
   user_idle_seconds() { if [ -e "$W/useridle" ]; then cat "$W/useridle"; else return 1; fi; }
   run_up() { local n; for n in "$@"; do touch "$W/running.d/$n"; done; }
@@ -446,9 +447,10 @@ e2e_run() { # args to claudes update
   [ ! -s "$W/events" ]
 }
 
-@test "fix 3b. recovery of reopen-pending waits while ShipIt is waiting" {
+@test "fix 3b. recovery of reopen-pending waits while the installer is mid-install" {
   echo none > "$W/state_word"; touch "$W/shipit_running"
-  _update_pending_write "$A"$'\t'"$W/Apps/Claude A.app"
+  echo "Beginning installation" > "$W/log"
+  _update_pending_write "$A"$'\t'"$W/Apps/Claude A.app" "" "" 0
   run cmd_update
   [ ! -s "$W/events" ]
   [ -e "$CLAUDES_STATE_DIR/reopen-pending" ]
@@ -534,8 +536,9 @@ open $W/Apps/Claude C.app" ]
   [ ! -e "$CLAUDES_STATE_DIR/update.lock" ]
 }
 
-@test "fix 7b. interrupted while the installer is running: nothing is reopened, the list stays" {
+@test "fix 7b. interrupted while the installer is mid-install: nothing is reopened, the list stays" {
   echo none > "$W/mode"; touch "$W/shipit_running"
+  shipit_log_since() { echo "Beginning installation"; }
   run_up Claude Claude-3p
   claudes_sleep() { echo "$1" >> "$W/sleeps"; if [ -e "$W/stopped" ]; then bash -c 'echo $PPID' > "$W/me"; kill -TERM "$(cat "$W/me")"; fi; }
   run cmd_update
@@ -609,4 +612,96 @@ open $W/Apps/Claude C.app" ]
   run cmd_update --watch-run
   [ "$(wc -l < "$CLAUDES_LOG_DIR/update-watcher.log" | tr -d ' ')" = 2000 ]
   [ "$(tail -n 1 "$CLAUDES_LOG_DIR/update-watcher.log" | cut -d' ' -f1-2)" = "line 30000" ]
+}
+
+# ---- second review round ----
+
+# run cmd_update in a clean bash (no bats traps) with the fake world's functions; extra shell given as $1, e.g. redirections
+clean_run() {   # SHELLCODE -> status of a clean "bash -euo pipefail" that has all current functions
+  export W SUP A C D E CLOCK_STEP
+  bash -c "$(declare -f)
+$(declare -p $(compgen -v | grep -E '^(CLAUDES_|UPDATE_|_KA_|_ka_|_PLIST|_SHIPIT)') 2>/dev/null)
+trap - ERR DEBUG; set -euo pipefail
+$1"
+}
+
+hup_sleep() {   # fake sleep: the first time after the accounts are stopped, send HUP to this process
+  echo "$1" >> "$W/sleeps"; echo $(( $(cat "$W/clock") + $1 )) > "$W/clock"
+  if [ -e "$W/stopped" ] && [ ! -e "$W/hup-sent" ]; then
+    touch "$W/hup-sent"; bash -c 'echo $PPID' > "$W/me"; kill -HUP "$(cat "$W/me")"
+  fi
+}
+
+@test "A1. closing the Terminal (HUP) while the output pipe is broken: the run completes and reopens" {
+  export CLAUDES_LOG_DIR="$W/logs"
+  echo none > "$W/mode"
+  run_up Claude Claude-3p
+  claudes_sleep() { hup_sleep "$@"; }
+  clean_run 'cmd_update 2>&1' | head -n 2 > /dev/null || true
+  [ "$(events | grep -c '^open ')" = 2 ]
+  [ ! -e "$CLAUDES_STATE_DIR/reopen-pending" ]
+}
+
+@test "A2. after HUP the rest of the output goes to update.log" {
+  export CLAUDES_LOG_DIR="$W/logs"
+  echo none > "$W/mode"
+  run_up Claude
+  claudes_sleep() { hup_sleep "$@"; }
+  clean_run 'cmd_update' > /dev/null 2>&1 || true
+  grep -q "Terminal was closed" "$CLAUDES_LOG_DIR/update.log"
+  grep -q "Reopening Claude A" "$CLAUDES_LOG_DIR/update.log"
+}
+
+@test "D. interrupt with ShipIt only waiting (no Beginning installation) reopens" {
+  echo none > "$W/mode"; touch "$W/shipit_running"
+  run_up Claude Claude-3p
+  claudes_sleep() { echo "$1" >> "$W/sleeps"; if [ -e "$W/stopped" ]; then bash -c 'echo $PPID' > "$W/me"; kill -TERM "$(cat "$W/me")"; fi; }
+  run cmd_update
+  [ "$status" -eq 1 ]
+  [ "$(events | grep -c '^open ')" = 2 ]
+  [ ! -e "$CLAUDES_STATE_DIR/reopen-pending" ]
+}
+
+@test "D2. interrupt after the installer finished reopens" {
+  echo none > "$W/mode"
+  run_up Claude
+  shipit_log_since() { printf 'Beginning installation\nInstallation completed successfully\n'; }
+  UPDATE_LOG_OFFSET=0
+  run _update_install_started 0
+  [ "$status" -eq 1 ]
+}
+
+@test "E. while an update waits, a marker older than the update itself is not reopened" {
+  run_up Claude-3p
+  set_marker Claude-Acct-D update 46800
+  echo 20000 > "$W/staged_age"            # the update was staged 20000s ago, the marker is older
+  run cmd_update
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Quitting together: Claude C"* ]]
+  [[ "$output" != *"Claude D"* ]]
+}
+
+@test "F1. leftover reopen-pending with the installer finished is recovered although ShipIt reads running" {
+  echo none > "$W/state_word"; touch "$W/shipit_running"
+  printf 'Beginning installation\nInstallation completed successfully\n' > "$W/log"
+  _update_pending_write "$A"$'\t'"$W/Apps/Claude A.app" "" "" 0
+  run cmd_update
+  [ "$status" -eq 0 ]
+  [ "$(events | grep '^open ')" = "open $W/Apps/Claude A.app" ]
+  [ ! -e "$CLAUDES_STATE_DIR/reopen-pending" ]
+}
+
+@test "F2. leftover reopen-pending with no Beginning installation at all is recovered" {
+  echo none > "$W/state_word"; touch "$W/shipit_running"
+  _update_pending_write "$A"$'\t'"$W/Apps/Claude A.app" "" "" 0
+  run cmd_update
+  [ "$(events | grep '^open ')" = "open $W/Apps/Claude A.app" ]
+}
+
+@test "F3. only the log after the recorded offset counts" {
+  echo none > "$W/state_word"; touch "$W/shipit_running"
+  echo "Beginning installation" > "$W/log"      # an old, unfinished line from before we quit
+  _update_pending_write "$A"$'\t'"$W/Apps/Claude A.app" "" "" "$(wc -c < "$W/log" | tr -d ' ')"
+  run cmd_update
+  [ "$(events | grep -c '^open ')" = 1 ]
 }

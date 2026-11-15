@@ -210,7 +210,7 @@ account_idle() {
   fi
 
   if [ -d "$dir/local-agent-mode-sessions" ]; then   # Cowork
-    newest="$(find "$dir/local-agent-mode-sessions" -type f -mmin "-$CLAUDES_IDLE_MINUTES" \
+    newest="$(find "$dir/local-agent-mode-sessions" -type f -not -path '*/skills-plugin/*' -mmin "-$CLAUDES_IDLE_MINUTES" \
       -exec stat -f %m {} + 2>/dev/null | sort -n | tail -n 1 || true)"
     if [ -n "$newest" ]; then
       mins=$(( ($(date +%s) - newest) / 60 ))
