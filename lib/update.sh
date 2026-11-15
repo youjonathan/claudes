@@ -93,11 +93,13 @@ _update_run() {
   case "$state" in
     none)
       echo "No Claude update is waiting."
+      _update_dry_report
       update_safety_net
       return 0;;
     no-installer)
       echo "A Claude update was downloaded, but Claude's installer is not waiting for it."
       echo "It will come back by itself the next time Claude starts. Nothing needs doing now."
+      _update_dry_report
       update_safety_net
       return 0;;
     waiting) ;;
@@ -166,12 +168,24 @@ _update_run() {
   return "$reopen_rc"
 }
 
+# dry run only: show what the tool sees (open accounts, idle status) even with no update waiting
+_update_dry_report() {
+  local busy=""
+  [ "$UPDATE_DRY" = 1 ] || return 0
+  UPDATE_ACCOUNTS="$(update_open_accounts)"
+  busy="$(update_all_idle || true)"
+  _update_print_accounts "$busy"
+  echo
+  echo "Accounts that quit for an update and did not come back:"
+  return 0
+}
+
 # VERSION BUILD -> "1.2.3 (build 456)"
 _update_ver() { echo "${1:-?} (build ${2:-?})"; }
 
-# BUSYTEXT -> prints the dry-run plan
-_update_print_plan() {
-  local busy="$1" d l n line how
+# BUSYTEXT -> prints the open accounts and each one's idle status
+_update_print_accounts() {
+  local busy="$1" d l n line
   echo
   echo "Open accounts:"
   if [ -z "$UPDATE_ACCOUNTS" ]; then echo "  none"; fi
@@ -183,6 +197,12 @@ _update_print_plan() {
   done <<EOF
 $UPDATE_ACCOUNTS
 EOF
+}
+
+# BUSYTEXT -> prints the dry-run plan
+_update_print_plan() {
+  local busy="$1" d l n how
+  _update_print_accounts "$busy"
   echo
   echo "What claudes update would do:"
   if [ -n "$busy" ]; then
@@ -235,7 +255,8 @@ doctor_update_report() {
 
 # -> lines DATADIR<TAB>LAUNCHER for running accounts plus accounts down with a fresh update marker
 update_open_accounts() {
-  local nl=$'\n' seen="$nl" pid d l age pf
+  local nl seen pid d l age pf
+  nl=$'\n'; seen="$nl"
   while IFS=$'\t' read -r pid d; do
     [ -n "$d" ] || continue
     case "$seen" in *"$nl$d$nl"*) continue;; esac
@@ -485,7 +506,9 @@ update_safety_net() {
       printf '%s\t%s\n' "$d" "$l" >> "$tmp"
     fi
   done < <(known_accounts 2>/dev/null || true)
-  if [ "$UPDATE_DRY" != 1 ]; then
+  if [ "$UPDATE_DRY" = 1 ]; then
+    if [ "$found" = 0 ]; then echo "  none"; fi
+  else
     if [ "$found" = 1 ]; then _update_reopen_file "$tmp" || true; fi
     rm -f "$tmp"
   fi

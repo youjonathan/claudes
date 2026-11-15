@@ -37,6 +37,7 @@ setup() {
   # the "sample window" passes: swap in the second process table if a test made one
   claudes_sleep() { if [ -f "$T/procs2" ]; then cp "$T/procs2" "$T/procs"; fi; }
   : > "$T/procs"; : > "$T/mainprocs"
+  set -euo pipefail   # the real script runs this way
 }
 
 # ---- helpers ----

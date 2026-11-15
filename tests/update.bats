@@ -75,6 +75,7 @@ setup() {
   claudes_sleep() { echo "$1" >> "$W/sleeps"; }
   run_up() { local n; for n in "$@"; do touch "$W/running.d/$n"; done; }
   set_marker() { echo "$2 $3" > "$W/markers/$1"; }
+  set -euo pipefail   # the real script runs this way; catch unset variables and aborted pipelines
 }
 
 events() { cat "$W/events"; }
@@ -314,4 +315,76 @@ open $W/Apps/Claude D.app" ]
   run doctor_update_report
   [[ "$output" == *"auto-updates: BLOCKED by $W/blocked (claudes update needs Claude's own updater on)"* ]]
   [[ "$output" == *"watcher: installed"* ]]
+}
+
+# ---- end to end: the real bin/claudes as a subprocess (set -euo pipefail), fake ps/launchctl on PATH ----
+e2e_world() {
+  T="$BATS_TEST_TMPDIR/e2e"
+  mkdir -p "$T/bin" "$T/apps" "$T/support" "$T/shipit/update.X/Claude.app/Contents" "$T/app/Claude.app/Contents/MacOS" "$T/home" "$T/managed"
+  for s in A:Claude C:Claude-3p D:Claude-Acct-D; do
+    mkdir -p "$T/apps/Claude ${s%%:*}.app/Contents/MacOS" "$T/support/${s#*:}"
+    printf '%s\t%s\t%s\n' "${s%%:*}" blue "${s#*:}" >> "$T/config"
+  done
+  cat > "$T/app/Claude.app/Contents/Info.plist" <<'P'
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleShortVersionString</key><string>1.0.0</string>
+<key>CFBundleVersion</key><string>100</string>
+</dict></plist>
+P
+  sed -e 's/1.0.0/2.0.0/' -e 's/>100</>200</' "$T/app/Claude.app/Contents/Info.plist" > "$T/shipit/update.X/Claude.app/Contents/Info.plist"
+  cat > "$T/shipit/ShipItState.plist" <<P
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>updateBundleURL</key><string>file://$T/shipit/update.X/Claude.app/</string></dict></plist>
+P
+  BIN="$T/app/Claude.app/Contents/MacOS/Claude"
+  cat > "$T/ps.txt" <<P
+ 501 1 $BIN
+ 502 1 $BIN --user-data-dir=$T/support/Claude-3p
+ 503 1 $BIN --user-data-dir=$T/support/Claude-Acct-D
+ 504 502 $T/app/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer)
+P
+  cat > "$T/bin/ps" <<'P'
+#!/bin/bash
+case "$*" in *-axo*) cat "$E2E_PS";; esac
+exit 0
+P
+  printf '#!/bin/sh\necho "\tstate = running"\n' > "$T/bin/launchctl"
+  chmod +x "$T/bin/ps" "$T/bin/launchctl"
+  mkdir -p "$T/support/Claude-3p/claude-code-sessions"; touch "$T/support/Claude-3p/claude-code-sessions/work.json"
+}
+
+e2e_run() { # args to claudes update
+  run env -i HOME="$T/home" USER=tester PATH="$T/bin:/usr/bin:/bin:/usr/sbin:/sbin" E2E_PS="$T/ps.txt" \
+    CLAUDES_APP_SRC="$T/app/Claude.app" CLAUDES_APPS_DIR="$T/apps" CLAUDES_SUPPORT_DIR="$T/support" \
+    CLAUDES_SHIPIT_DIR="$T/shipit" CLAUDES_MANAGED_PREFS_DIR="$T/managed" CLAUDES_CONFIG="$T/config" \
+    CLAUDES_STATE_DIR="$T/state" CLAUDES_CPU_SAMPLE=1 \
+    /bin/bash "$BATS_TEST_DIRNAME/../bin/claudes" update "$@"
+}
+
+@test "e2e: bin/claudes update --dry-run with a waiting update lists the open accounts by launcher name" {
+  e2e_world
+  e2e_run --dry-run
+  echo "$output"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"unbound variable"* ]]
+  [[ "$output" == *"A Claude update is waiting to install (build 100 -> 200)"* ]]
+  [[ "$output" == *"Quit these together: Claude A, Claude C, Claude D"* ]]
+  [[ "$output" == *"Claude C is busy: session files changed"* ]]
+  [[ "$output" == *"Claude A: idle"* ]]
+  [ ! -e "$T/state" ]
+}
+
+@test "e2e: dry-run with no update waiting still shows open accounts and the safety net" {
+  e2e_world
+  rm "$T/shipit/ShipItState.plist"
+  e2e_run --dry-run
+  echo "$output"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"No Claude update is waiting."* ]]
+  [[ "$output" == *"Open accounts:"* ]]
+  [[ "$output" == *"Claude A: idle"* ]]
+  [[ "$output" == *"Claude C is busy"* ]]
+  [[ "$output" == *"Accounts that quit for an update and did not come back:"* ]]
+  [ ! -e "$T/state" ]
 }

@@ -39,6 +39,7 @@ STUB
 
   source "$REPO/lib/common.sh"; source "$REPO/lib/procs.sh"
   claudes_sleep() { :; }
+  set -euo pipefail   # the real script runs this way
 }
 
 # add_proc PID PPID COMMAND...

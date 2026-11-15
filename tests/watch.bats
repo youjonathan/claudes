@@ -19,6 +19,7 @@ STUB
   LABEL=io.github.youjonathan.claudes.update-watcher
   PLIST="$T/agents/$LABEL.plist"
   UID_="$(id -u)"
+  set -euo pipefail   # the real script runs this way
 }
 
 # run a watch subcommand with the libs sourced; auto_updates_blocked is faked
