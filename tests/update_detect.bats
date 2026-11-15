@@ -376,3 +376,38 @@ TABLE
   run inside_claude_copy 401
   [ "$status" -eq 1 ]
 }
+
+@test "account_idle: busy by recent Cowork (local-agent-mode-sessions) file" {
+  stub_ps
+  printf '100\t%s\n' "$(DD)" > "$T/mainprocs"
+  mkdir -p "$(DD)/local-agent-mode-sessions/a"
+  touch "$(DD)/local-agent-mode-sessions/a/s.json"
+  run account_idle "$(DD)"
+  [ "$status" -eq 1 ]
+  [[ "$output" == "Cowork files changed "*" min ago" ]]
+}
+
+@test "account_idle: old Cowork files do not make it busy" {
+  stub_ps
+  printf '100\t%s\n' "$(DD)" > "$T/mainprocs"
+  mkdir -p "$(DD)/local-agent-mode-sessions/a"
+  touch -t 202001010000 "$(DD)/local-agent-mode-sessions/a/s.json"
+  printf '100 1 0:10.00 %s/Contents/MacOS/Claude\n' "$CLAUDES_APP_SRC" > "$T/procs"
+  run account_idle "$(DD)"
+  [ "$status" -eq 0 ]
+}
+
+@test "user_idle_seconds reads HIDIdleTime from ioreg" {
+  printf '#!/bin/bash\necho "    | |   \\"HIDIdleTime\\" = 125000000000"\n' > "$T/bin/ioreg"
+  chmod +x "$T/bin/ioreg"
+  run user_idle_seconds
+  [ "$status" -eq 0 ]
+  [ "$output" = 125 ]
+}
+
+@test "user_idle_seconds fails when ioreg gives nothing" {
+  printf '#!/bin/bash\nexit 0\n' > "$T/bin/ioreg"
+  chmod +x "$T/bin/ioreg"
+  run user_idle_seconds
+  [ "$status" -eq 1 ]
+}

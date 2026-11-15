@@ -75,12 +75,33 @@ _procs_owned() {
   done < <(_procs_ps)
 }
 
-# "PIDS" DATADIR -> those pids (plus any crashpad handler for DATADIR) still present in ps, one per line
+# RECORDED PID -> the command line recorded for PID (RECORDED = lines PID<TAB>COMMAND); status 1 if PID is not recorded
+_procs_recorded_cmd() {
+  local p c
+  while IFS=$'\t' read -r p c; do
+    if [ "$p" = "$2" ]; then printf '%s' "$c"; return 0; fi
+  done <<EOF
+$1
+EOF
+  return 1
+}
+
+# "PIDS" -> lines PID<TAB>COMMAND for those pids as they are now
+_procs_record() {
+  local tracked=" $1 " pid ppid cmd
+  while read -r pid ppid cmd; do
+    case "$tracked" in *" $pid "*) printf '%s\t%s\n' "$pid" "$cmd";; esac
+  done < <(_procs_ps)
+}
+
+# RECORDED DATADIR -> recorded pids still running with the SAME command line (a reused pid is not ours),
+# plus any crashpad handler for DATADIR, one per line
 _procs_alive() {
-  local tracked=" $1 " dd="$2" pid ppid cmd
+  local rec="$1" dd="$2" pid ppid cmd want
   {
     while read -r pid ppid cmd; do
-      case "$tracked" in *" $pid "*) echo "$pid";; esac
+      want="$(_procs_recorded_cmd "$rec" "$pid")" || continue
+      if [ "$want" = "$cmd" ]; then echo "$pid"; fi
     done < <(_procs_ps)
     crashpad_pids "$dd"
   } | sort -un
@@ -88,22 +109,32 @@ _procs_alive() {
 
 # DATADIR [TIMEOUT] -> SIGTERM then SIGKILL the copy and its Claude-owned tree; 0 when gone, 1 if still alive; never signals ShipIt
 stop_datadir() {
-  local datadir="$1" timeout="${2:-$CLAUDES_STOP_TIMEOUT}" main tracked alive i=0
+  local datadir="$1" timeout="${2:-$CLAUDES_STOP_TIMEOUT}" main tracked rec alive killable p now want i=0
   main="$(datadir_main_pid "$datadir")" || return 0
   tracked="$(_procs_owned "$main" | tr '\n' ' ')"
+  rec="$(_procs_record "$tracked")"
   _procs_signal TERM "$main"
   while :; do
-    alive="$(_procs_alive "$tracked" "$datadir")"
+    alive="$(_procs_alive "$rec" "$datadir")"
     [ -z "$alive" ] && return 0
     [ "$i" -ge "$timeout" ] && break
     claudes_sleep 1; i=$((i + 1))
   done
+  # only kill a pid that still has the command line recorded at the start (pids get reused)
+  killable=""
+  for p in $alive; do
+    if want="$(_procs_recorded_cmd "$rec" "$p")"; then
+      now="$(_procs_record "$p" | head -n 1 | cut -f2-)"
+      [ "$now" = "$want" ] || continue
+    fi
+    killable="$killable $p"
+  done
   # shellcheck disable=SC2086
-  _procs_signal KILL $alive
+  [ -z "$killable" ] || _procs_signal KILL $killable
   i=0
   while [ "$i" -lt 10 ]; do
     claudes_sleep 1; i=$((i + 1))
-    alive="$(_procs_alive "$tracked" "$datadir")"
+    alive="$(_procs_alive "$rec" "$datadir")"
     [ -z "$alive" ] && return 0
   done
   return 1

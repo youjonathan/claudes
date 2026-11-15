@@ -69,21 +69,55 @@ finally installs, it reopens only a plain Claude, not your accounts.
 `claudes update` finishes the job. It:
 
 1. checks that an update is waiting,
-2. waits until every open account is idle (no Claude Code session working: no session activity
-   for 10 minutes and almost no CPU use by Claude Code),
+2. waits until every open account is idle (see "What counts as idle" below),
 3. quits them all together,
 4. lets Claude's own installer finish,
 5. closes the plain Claude the installer opens, and
 6. reopens each account from its own launcher, so every Dock icon is right.
+
+An account that closed itself for the update while others were still busy is reopened at the
+end, together with the others, however long the wait was.
 
 `claudes update --dry-run` shows what it would do without quitting anything. Run it from
 Terminal, not from inside Claude. It refuses to run there, because quitting Claude would stop it.
 
 To have this happen on its own, run `claudes watch on`. That installs a background helper (a
 launchd agent, which is macOS's built-in way to run something on a timer). Every 5 minutes it
-checks for a waiting update and does the same as `claudes update`. It also reopens an account
-that closed itself for an update while other accounts were still busy. `claudes watch status`
-shows whether it is running, and `claudes watch off` removes it.
+checks for a waiting update and does the same as `claudes update`. `claudes watch status` shows
+whether it is running, and `claudes watch off` removes it. Its log is
+`~/Library/Logs/claudes/update-watcher.log` (cut to its last 2000 lines once it passes 1 MB).
+If an account does not come back after a reopen, the helper shows a macOS notification.
+
+The helper also has a safety net for an account that closed itself for an update and was never
+reopened. It reopens such an account only when the install did **not** happen: no update is
+waiting any more, or Claude's installer is not waiting, and the account has stayed closed for
+5 minutes (and less than 12 hours). While the update is still waiting and other accounts are
+busy, that account simply stays closed; when the update installs, it is reopened with the others.
+
+### What counts as idle
+
+An account counts as busy if any of these is true:
+
+- a Claude Code or Cowork session file in its data folder changed in the last 10 minutes
+  (`CLAUDES_IDLE_MINUTES`),
+- Claude Code used more than 2 seconds of CPU during a 20 second sample
+  (`CLAUDES_CPU_IDLE`, `CLAUDES_CPU_SAMPLE`).
+
+The background helper also waits until nobody has touched the keyboard or mouse for 10
+minutes (the same `CLAUDES_IDLE_MINUTES`). If it can't read that, it waits. A manual
+`claudes update` does not look at keyboard use, since you are typing in Terminal.
+
+Other settings, all environment variables: `CLAUDES_POLL` (seconds between idle re-checks, 60),
+`CLAUDES_MAX_WAIT` (how long a manual run waits for busy accounts before giving up, 14400),
+`CLAUDES_STOP_TIMEOUT`, `CLAUDES_INSTALL_TIMEOUT`, `CLAUDES_MARKER_GRACE`,
+`CLAUDES_MARKER_MAX_AGE`.
+
+### Where it keeps its notes
+
+`~/Library/Application Support/claudes` (`CLAUDES_STATE_DIR`) holds `reopen-pending`, the list
+of accounts closed for an update that still need reopening (an interrupted run picks it up
+next time; entries older than 24 hours are ignored), and `update.lock`, which stops two runs
+from overlapping.
 
 If your Mac has a management profile that turns Claude's auto-updates off
 (`disableAutoUpdates`), the helper can't work. `claudes doctor` tells you.

@@ -12,7 +12,7 @@ setup() {
 
   SUP="$CLAUDES_SUPPORT_DIR"
   A="$SUP/Claude"; C="$SUP/Claude-3p"; D="$SUP/Claude-Acct-D"; E="$SUP/Claude-E"
-  : > "$W/events"; : > "$W/sleeps"; : > "$W/log"
+  : > "$W/events"; : > "$W/sleeps"; : > "$W/log"; echo 1000000 > "$W/clock"
   echo 100 > "$W/build"
   echo waiting > "$W/state_word"
   echo success > "$W/mode"
@@ -50,7 +50,7 @@ setup() {
       success)
         echo 101 > "$W/build"
         printf 'Installation completed successfully\nSuccessfully launched application at file:///X/\n' >> "$W/log"
-        touch "$W/running.d/Claude";;
+        [ -e "$W/noplain" ] || touch "$W/running.d/Claude";;
       cancel) echo "Installation cancelled: App Still Running Error" >> "$W/log";;
     esac
     return 0
@@ -66,13 +66,18 @@ setup() {
     local arg d="" last="" a
     echo "open $*" >> "$W/events"
     if [ "$1" = "-n" ]; then
-      for a in "$@"; do last="$a"; done; d="${last#--user-data-dir=}"
+      for a in "$@"; do last="$a"; done
+      case "$last" in --user-data-dir=*) d="${last#--user-data-dir=}";; *) d="$A";; esac
     elif [ "$1" = "$CLAUDES_APP_SRC" ]; then d="$A"
     else d="$(awk -F'\t' -v l="$1" '$2==l{print $1}' "$W/accounts")"; fi
-    [ -z "$d" ] || touch "$W/running.d/$(basename "$d")"
+    [ -z "$d" ] || [ -e "$W/noopen" ] || touch "$W/running.d/$(basename "$d")"
     return 0
   }
-  claudes_sleep() { echo "$1" >> "$W/sleeps"; }
+  claudes_sleep() { echo "$1" >> "$W/sleeps"; echo $(( $(cat "$W/clock") + ${CLOCK_STEP:-$1} )) > "$W/clock"; }
+  claudes_now() { cat "$W/clock"; }
+  claudes_notify() { echo "$*" >> "$W/notes"; }
+  shipit_waiting() { [ -e "$W/shipit_running" ]; }
+  user_idle_seconds() { if [ -e "$W/useridle" ]; then cat "$W/useridle"; else return 1; fi; }
   run_up() { local n; for n in "$@"; do touch "$W/running.d/$n"; done; }
   set_marker() { echo "$2 $3" > "$W/markers/$1"; }
   set -euo pipefail   # the real script runs this way; catch unset variables and aborted pipelines
@@ -164,7 +169,8 @@ events() { cat "$W/events"; }
   run cmd_update
   echo "$output"
   [ "$status" -eq 0 ]
-  [ "$(wc -l < "$W/pending-at-first-stop" | tr -d ' ')" = 3 ]
+  [ "$(grep -vc '^#' "$W/pending-at-first-stop")" = 3 ]
+  grep -q '^#ts' "$W/pending-at-first-stop"
   [ ! -e "$CLAUDES_STATE_DIR/reopen-pending" ]
   [ ! -e "$CLAUDES_STATE_DIR/update.lock" ]
   # every stop comes before the first open; plain Claude (default folder) is stopped a second time
@@ -387,4 +393,220 @@ e2e_run() { # args to claudes update
   [[ "$output" == *"Claude C is busy"* ]]
   [[ "$output" == *"Accounts that quit for an update and did not come back:"* ]]
   [ ! -e "$T/state" ]
+}
+
+# ---- review fixes ----
+
+@test "fix 1a. (reviewer repro) main gone but a helper lingers: account is still reopened" {
+  run_up Claude Claude-3p
+  stop_datadir() {
+    echo "stop $1" >> "$W/events"
+    rm -f "$W/running.d/$(basename "$1")"; touch "$W/stopped"
+    [ "$(basename "$1")" != Claude-3p ]   # main exited, but a tracked helper survived KILL -> 1
+  }
+  run cmd_update
+  echo "$output"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"leftover parts of Claude C"* ]]
+  [ -e "$W/running.d/Claude-3p" ]
+  [ -e "$W/running.d/Claude" ]
+}
+
+@test "fix 1b. a main still running: no install wait, closed accounts stay listed until confirmed back" {
+  touch "$W/nostop/Claude-3p" "$W/noopen"
+  run_up Claude Claude-3p Claude-Acct-D
+  run cmd_update
+  [ "$status" -eq 1 ]
+  [[ "$output" != *"Waiting for Claude's installer"* ]]
+  # A and D closed but could not be reopened (noopen): both stay in the list, C (still running) is not listed
+  [ "$(grep -v '^#' "$CLAUDES_STATE_DIR/reopen-pending" | cut -f1 | sort | tr '\n' ' ')" = "$A $D " ]
+}
+
+@test "fix 2. (reviewer repro) an account that closed itself 13h ago while another stays busy is reopened at the end" {
+  run_up Claude-3p
+  set_marker Claude-Acct-D update 46800
+  run cmd_update
+  echo "$output"
+  [ "$status" -eq 0 ]
+  [ -e "$W/running.d/Claude-Acct-D" ]
+  [[ "$output" == *"Quitting together: Claude C, Claude D"* ]]
+}
+
+@test "fix 2b. without a waiting update a 13h-old marker is left alone" {
+  echo none > "$W/state_word"
+  set_marker Claude-Acct-D update 46800
+  run cmd_update
+  [ ! -s "$W/events" ]
+}
+
+@test "fix 3a. safety net does nothing while ShipIt is waiting, even if the state reads none" {
+  echo none > "$W/state_word"; touch "$W/shipit_running"
+  set_marker Claude update 400
+  run update_safety_net
+  [ ! -s "$W/events" ]
+}
+
+@test "fix 3b. recovery of reopen-pending waits while ShipIt is waiting" {
+  echo none > "$W/state_word"; touch "$W/shipit_running"
+  _update_pending_write "$A"$'\t'"$W/Apps/Claude A.app"
+  run cmd_update
+  [ ! -s "$W/events" ]
+  [ -e "$CLAUDES_STATE_DIR/reopen-pending" ]
+}
+
+@test "fix 4a. a changed build while the installer is still running is not success" {
+  UPDATE_OLD_BUILD=100; UPDATE_LOG_OFFSET=0; CLOCK_STEP=2
+  echo 101 > "$W/build"; touch "$W/shipit_running"
+  run update_wait_install
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"did not finish"* ]]
+}
+
+@test "fix 4b. a changed build with the installer finished is success" {
+  UPDATE_OLD_BUILD=100; UPDATE_LOG_OFFSET=0
+  echo 101 > "$W/build"
+  run update_wait_install
+  [ "$status" -eq 0 ]
+}
+
+@test "fix 4c. the completed line alone is success" {
+  UPDATE_OLD_BUILD=100; UPDATE_LOG_OFFSET=0
+  touch "$W/shipit_running"
+  echo "Installation completed successfully" > "$W/log"
+  run update_wait_install
+  [ "$status" -eq 0 ]
+}
+
+@test "fix 5. the plain relaunch is still closed when it appears 6s after the launched line" {
+  touch "$W/noplain"
+  run_up Claude Claude-3p
+  claudes_sleep() {
+    echo "$1" >> "$W/sleeps"; echo $(( $(cat "$W/clock") + $1 )) > "$W/clock"
+    if [ -e "$W/installed" ]; then
+      echo x >> "$W/post"
+      if [ "$(wc -l < "$W/post" | tr -d ' ')" -ge 3 ]; then touch "$W/running.d/Claude"; fi
+    fi
+  }
+  run cmd_update
+  [ "$status" -eq 0 ]
+  [ "$(events | grep -c "^stop $A\$")" = 2 ]
+  [[ "$output" == *"Closing the plain Claude"* ]]
+}
+
+@test "fix 6a. an account that does not come back stays in reopen-pending with a try counted" {
+  touch "$W/noopen"
+  mkdir -p "$CLAUDES_STATE_DIR"
+  _update_pending_write "$A"$'\t'"$W/Apps/Claude A.app"
+  run update_reopen_accounts
+  [ "$status" -eq 1 ]
+  grep -q "^$A	" "$CLAUDES_STATE_DIR/reopen-pending"
+  [ "$(_update_pending_tries "$A")" = 1 ]
+}
+
+@test "fix 6b. after 3 tries the account is dropped with a message" {
+  touch "$W/noopen"
+  _update_pending_write "$A"$'\t'"$W/Apps/Claude A.app" "" "#tries"$'\t'"$A"$'\t'2
+  run update_reopen_accounts
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Giving up on Claude A after 3 tries"* ]]
+  [ ! -e "$CLAUDES_STATE_DIR/reopen-pending" ]
+}
+
+@test "fix 6c. under --watch-run a failed reopen posts a notification" {
+  touch "$W/noopen"
+  UPDATE_WATCH=1
+  _update_pending_write "$A"$'\t'"$W/Apps/Claude A.app"
+  run update_reopen_accounts
+  [ "$status" -eq 1 ]
+  [[ "$(cat "$W/notes")" == *"Could not reopen: Claude A"* ]]
+}
+
+@test "fix 7a. interrupted after quitting, installer not running: accounts are reopened and the lock released" {
+  echo none > "$W/mode"
+  run_up Claude Claude-3p
+  claudes_sleep() { echo "$1" >> "$W/sleeps"; if [ -e "$W/stopped" ]; then bash -c 'echo $PPID' > "$W/me"; kill -TERM "$(cat "$W/me")"; fi; }
+  run cmd_update
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Interrupted"* ]]
+  [ "$(events | grep '^open ')" = "open $W/Apps/Claude A.app
+open $W/Apps/Claude C.app" ]
+  [ ! -e "$CLAUDES_STATE_DIR/reopen-pending" ]
+  [ ! -e "$CLAUDES_STATE_DIR/update.lock" ]
+}
+
+@test "fix 7b. interrupted while the installer is running: nothing is reopened, the list stays" {
+  echo none > "$W/mode"; touch "$W/shipit_running"
+  run_up Claude Claude-3p
+  claudes_sleep() { echo "$1" >> "$W/sleeps"; if [ -e "$W/stopped" ]; then bash -c 'echo $PPID' > "$W/me"; kill -TERM "$(cat "$W/me")"; fi; }
+  run cmd_update
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"will reopen your accounts"* ]]
+  [ "$(events | grep -c '^open ')" = 0 ]
+  [ -e "$CLAUDES_STATE_DIR/reopen-pending" ]
+  [ ! -e "$CLAUDES_STATE_DIR/update.lock" ]
+}
+
+@test "fix 7c. a reopen-pending older than 24h is ignored and deleted" {
+  echo none > "$W/state_word"
+  _update_pending_write "$A"$'\t'"$W/Apps/Claude A.app" 900000
+  run cmd_update
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ignored and deleted"* ]]
+  [ ! -s "$W/events" ]
+  [ ! -e "$CLAUDES_STATE_DIR/reopen-pending" ]
+}
+
+@test "fix 8. the default folder with no launcher is reopened with open -n -a" {
+  printf '%s\t%s\n' "$A" "" > "$W/accounts"
+  _update_pending_write "$A"$'\t'
+  run update_reopen_accounts
+  [ "$(events)" = "open -n -a $CLAUDES_APP_SRC" ]
+}
+
+@test "fix 9a. watch-run waits while someone used the Mac recently" {
+  run_up Claude Claude-3p
+  echo 120 > "$W/useridle"
+  run cmd_update --watch-run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"someone used the Mac 2 min ago"* ]]
+  [ ! -s "$W/events" ]
+}
+
+@test "fix 9b. watch-run waits when the idle time cannot be read" {
+  run_up Claude
+  run cmd_update --watch-run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"can't tell if someone is using the Mac"* ]]
+  [ ! -s "$W/events" ]
+}
+
+@test "fix 9c. watch-run proceeds when the Mac has been idle long enough; a manual run ignores user idle time" {
+  run_up Claude
+  echo 700 > "$W/useridle"
+  run cmd_update --watch-run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Claude updated"* ]]
+  rm -rf "$W/stopped" "$W/installed" "$W/running.d/"*; run_up Claude
+  echo 5 > "$W/useridle"; echo 100 > "$W/build"
+  run cmd_update
+  [[ "$output" == *"Claude updated"* ]]
+}
+
+@test "fix 11. the manual-run wait is measured with the clock, not by adding up poll intervals" {
+  run_up Claude Claude-3p
+  echo 99 > "$W/busy/Claude-3p"
+  CLAUDES_MAX_WAIT=30; CLAUDES_POLL=1; CLOCK_STEP=20
+  run cmd_update
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Gave up waiting"* ]]
+  [ "$(wc -l < "$W/sleeps" | tr -d ' ')" = 2 ]
+}
+
+@test "fix 12. a watcher log over 1 MB is cut to its last 2000 lines at the start of a watch-run" {
+  echo none > "$W/state_word"
+  export CLAUDES_LOG_DIR="$W/logs"; mkdir -p "$CLAUDES_LOG_DIR"
+  awk 'BEGIN { for (i = 1; i <= 30000; i++) printf "line %d padded to make the file big enough for the limit\n", i }' > "$CLAUDES_LOG_DIR/update-watcher.log"
+  run cmd_update --watch-run
+  [ "$(wc -l < "$CLAUDES_LOG_DIR/update-watcher.log" | tr -d ' ')" = 2000 ]
+  [ "$(tail -n 1 "$CLAUDES_LOG_DIR/update-watcher.log" | cut -d' ' -f1-2)" = "line 30000" ]
 }

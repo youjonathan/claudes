@@ -3,14 +3,79 @@
 
 # globals shared by the step functions (cmd_update sets them)
 UPDATE_DRY=0               # 1 = dry run: never signal, open, write state or lock
+UPDATE_WATCH=0             # 1 = run by the background watcher (also needs the Mac idle)
+UPDATE_WAITING=0           # 1 = an update is waiting to install (markers of any age count)
 UPDATE_ACCOUNTS=""         # lines DATADIR<TAB>LAUNCHER for the accounts being handled
 UPDATE_OLD_BUILD=""        # installed build before the quit
 UPDATE_OLD_VERSION=""      # installed version before the quit
 UPDATE_LOG_OFFSET=0        # ShipIt log size before the quit
+UPDATE_NOTBACK=""          # lines DATADIR<TAB>LAUNCHER of accounts that did not come back up
+CLAUDES_PENDING_MAX_AGE="${CLAUDES_PENDING_MAX_AGE:-86400}"   # reopen-pending older than this is ignored
 
 claudes_open() { open "$@"; }   # every open goes through here so tests can replace it
+claudes_now() { date +%s; }     # seconds since the epoch; tests replace it
+claudes_notify() {              # TEXT -> macOS notification; tests replace it
+  local t; t="$(printf '%s' "$1" | tr -d '"\\')"
+  osascript -e "display notification \"$t\" with title \"claudes\"" >/dev/null 2>&1 || true
+}
 
 update_pending_file() { echo "$CLAUDES_STATE_DIR/reopen-pending"; }
+
+# reopen-pending: first line "#ts<TAB>EPOCH", then one "DATADIR<TAB>LAUNCHER" per closed account,
+# then optional "#tries<TAB>DATADIR<TAB>N" lines (how many reopen attempts failed)
+
+# -> epoch seconds written in reopen-pending, empty if none
+_update_pending_ts() {
+  local pf; pf="$(update_pending_file)"
+  [ -f "$pf" ] || return 0
+  awk -F'\t' '$1 == "#ts" { print $2; exit }' "$pf"
+}
+
+# -> status 0 when reopen-pending exists and is older than $CLAUDES_PENDING_MAX_AGE
+_update_pending_expired() {
+  local ts
+  ts="$(_update_pending_ts)"
+  case "$ts" in ''|*[!0-9]*) return 1;; esac
+  [ $(( $(claudes_now) - ts )) -gt "$CLAUDES_PENDING_MAX_AGE" ]
+}
+
+# -> the account lines of reopen-pending (nothing if missing or too old)
+update_pending_accounts() {
+  local pf; pf="$(update_pending_file)"
+  [ -f "$pf" ] || return 0
+  if _update_pending_expired; then return 0; fi
+  grep -v '^#' "$pf" | sed '/^$/d' || true
+}
+
+# DATADIR -> failed reopen attempts recorded for it (0 if none)
+_update_pending_tries() {
+  local pf n; pf="$(update_pending_file)"
+  [ -f "$pf" ] || { echo 0; return 0; }
+  n="$(awk -F'\t' -v d="$1" '$1 == "#tries" && $2 == d { print $3; exit }' "$pf")"
+  echo "${n:-0}"
+}
+
+# ACCOUNTLINES [TS] [TRIESLINES] -> write reopen-pending (atomically)
+_update_pending_write() {
+  local pf ts="${2:-}"; pf="$(update_pending_file)"
+  [ -n "$ts" ] || ts="$(claudes_now)"
+  mkdir -p "$CLAUDES_STATE_DIR"
+  { printf '#ts\t%s\n' "$ts"
+    printf '%s\n' "$1" | sed '/^$/d'
+    if [ -n "${3:-}" ]; then printf '%s\n' "$3" | sed '/^$/d'; fi
+  } > "$pf.tmp"
+  mv "$pf.tmp" "$pf"
+}
+
+# -> in a real run, drop a reopen-pending that is too old
+_update_pending_expire() {
+  local pf; pf="$(update_pending_file)"
+  if [ -f "$pf" ] && _update_pending_expired; then
+    echo "An old list of accounts to reopen (more than $((CLAUDES_PENDING_MAX_AGE / 3600)) hours old) was ignored and deleted."
+    rm -f "$pf"
+  fi
+  return 0
+}
 
 # DATADIR LAUNCHER -> the name to show the user (launcher name like "Claude C", else the folder name)
 update_account_name() {
@@ -31,6 +96,35 @@ EOF
   printf '%s' "$out"
 }
 
+# -> keep the watcher log small: over 1 MB, keep its last 2000 lines (truncated in place, launchd keeps writing)
+_update_trim_log() {
+  local f="$CLAUDES_LOG_DIR/update-watcher.log" size tmp
+  [ -f "$f" ] || return 0
+  size="$(wc -c < "$f" | tr -d ' ')"
+  [ "$size" -gt 1048576 ] || return 0
+  tmp="$(mktemp "${TMPDIR:-/tmp}/claudes-log.XXXXXX")"
+  tail -n 2000 "$f" > "$tmp"
+  cat "$tmp" > "$f"
+  rm -f "$tmp"
+  return 0
+}
+
+# on INT/TERM/HUP after accounts started quitting: put things back, or say who will
+_update_on_interrupt() {
+  trap - INT TERM HUP
+  echo
+  echo "Interrupted."
+  if shipit_waiting; then
+    echo "Claude's installer is running. The next 'claudes update' (or the background helper) will reopen your accounts."
+    echo "They are listed in $(update_pending_file)."
+  else
+    echo "Reopening the accounts that were closed."
+    update_reopen_accounts || true
+  fi
+  update_unlock
+  exit 1
+}
+
 # [--dry-run] [--watch-run] -> install a waiting Claude update and reopen accounts; exit status 0/1
 cmd_update() {
   local dry=0 watch=0 arg blocked rc=0
@@ -43,7 +137,7 @@ cmd_update() {
          return 1;;
     esac
   done
-  UPDATE_DRY="$dry"
+  UPDATE_DRY="$dry"; UPDATE_WATCH="$watch"; UPDATE_WAITING=0
 
   if blocked="$(auto_updates_blocked)"; then
     echo "Claude's own updater is switched off by this file:"
@@ -60,28 +154,31 @@ cmd_update() {
   fi
 
   if [ "$dry" = 1 ]; then
-    _update_run "$watch" || rc=$?
+    _update_run || rc=$?
     return "$rc"
   fi
 
+  if [ "$watch" = 1 ]; then _update_trim_log; fi
   if ! update_lock; then
     echo "Another claudes update is already in progress, so this one is stopping. Nothing was changed."
     return 0
   fi
-  _update_run "$watch" || rc=$?
+  _update_run || rc=$?
+  trap - INT TERM HUP
   update_unlock
   return "$rc"
 }
 
-# WATCH(0|1) -> steps 4-10 of the flow; status 0/1
+# -> the flow after the checks: recover, look at the update, wait for idle, quit, install, reopen; status 0/1
 _update_run() {
-  local watch="$1" state pf busy old new d l n names
-  pf="$(update_pending_file)"
+  local state busy old new pending names start elapsed
+  [ "$UPDATE_DRY" = 1 ] || _update_pending_expire
   state="$(update_state 2>/dev/null || true)"
 
   # a previous run that was interrupted leaves its list of accounts behind
-  if [ -f "$pf" ] && [ "$state" != waiting ]; then
-    names="$(update_names_of "$(cat "$pf")")"
+  pending="$(update_pending_accounts)"
+  if [ -n "$pending" ] && [ "$state" != waiting ] && ! shipit_waiting; then
+    names="$(update_names_of "$pending")"
     if [ "$UPDATE_DRY" = 1 ]; then
       echo "A previous update run was interrupted. It would reopen: $names"
     else
@@ -107,10 +204,11 @@ _update_run() {
        return 1;;
   esac
 
+  UPDATE_WAITING=1
   old="$(installed_build 2>/dev/null || true)"; new="$(staged_build 2>/dev/null || true)"
   echo "A Claude update is waiting to install (build ${old:-?} -> ${new:-?})."
 
-  local waited=0
+  start="$(claudes_now)"
   while :; do
     UPDATE_ACCOUNTS="$(update_open_accounts)"
     if busy="$(update_all_idle)"; then break; fi
@@ -120,17 +218,17 @@ _update_run() {
       return 0
     fi
     echo "$busy"
-    if [ "$watch" = 1 ]; then
+    if [ "$UPDATE_WATCH" = 1 ]; then
       echo "Not updating now. The background helper will try again later."
       return 0
     fi
-    if [ "$waited" -ge "$CLAUDES_MAX_WAIT" ]; then
-      echo "Gave up waiting after $((waited / 60)) minutes because an account is still busy. Nothing was quit."
+    elapsed=$(( $(claudes_now) - start ))
+    if [ "$elapsed" -ge "$CLAUDES_MAX_WAIT" ]; then
+      echo "Gave up waiting after $((elapsed / 60)) minutes because an account is still busy. Nothing was quit."
       return 1
     fi
     echo "Checking again in $CLAUDES_POLL seconds."
     claudes_sleep "$CLAUDES_POLL"
-    waited=$((waited + CLAUDES_POLL))
     state="$(update_state 2>/dev/null || true)"
     if [ "$state" != waiting ]; then
       echo "The update is no longer waiting. Nothing was quit."
@@ -152,12 +250,11 @@ _update_run() {
     return 1
   fi
 
-  local install_ok=0
+  local install_ok=0 reopen_rc=0
   update_wait_install || install_ok=1
   if [ "$install_ok" = 0 ]; then
     update_close_plain_relaunch || true
   fi
-  local reopen_rc=0
   update_reopen_accounts || reopen_rc=1
 
   if [ "$install_ok" = 1 ]; then
@@ -253,9 +350,10 @@ doctor_update_report() {
   return 0
 }
 
-# -> lines DATADIR<TAB>LAUNCHER for running accounts plus accounts down with a fresh update marker
+# -> lines DATADIR<TAB>LAUNCHER for running accounts plus accounts down with an update marker.
+#    While an update is waiting, a marker of any age counts: that account closed itself for this update.
 update_open_accounts() {
-  local nl seen pid d l age pf
+  local nl seen pid d l age
   nl=$'\n'; seen="$nl"
   while IFS=$'\t' read -r pid d; do
     [ -n "$d" ] || continue
@@ -269,29 +367,39 @@ update_open_accounts() {
     case "$seen" in *"$nl$d$nl"*) continue;; esac
     if datadir_running "$d"; then continue; fi
     marker_says_update_quit "$d" || continue
-    age="$(marker_age "$d" 2>/dev/null || true)"
-    case "$age" in ''|*[!0-9]*) continue;; esac
-    [ "$age" -le "$CLAUDES_MARKER_MAX_AGE" ] || continue
+    if [ "$UPDATE_WAITING" != 1 ]; then
+      age="$(marker_age "$d" 2>/dev/null || true)"
+      case "$age" in ''|*[!0-9]*) continue;; esac
+      [ "$age" -le "$CLAUDES_MARKER_MAX_AGE" ] || continue
+    fi
     seen="$seen$d$nl"
     printf '%s\t%s\n' "$d" "$l"
   done < <(known_accounts 2>/dev/null || true)
 
   # accounts a half-finished run already closed
-  pf="$(update_pending_file)"
-  if [ -f "$pf" ]; then
-    while IFS=$'\t' read -r d l; do
-      [ -n "$d" ] || continue
-      case "$seen" in *"$nl$d$nl"*) continue;; esac
-      seen="$seen$d$nl"
-      printf '%s\t%s\n' "$d" "$l"
-    done < "$pf"
-  fi
+  while IFS=$'\t' read -r d l; do
+    [ -n "$d" ] || continue
+    case "$seen" in *"$nl$d$nl"*) continue;; esac
+    seen="$seen$d$nl"
+    printf '%s\t%s\n' "$d" "$l"
+  done < <(update_pending_accounts)
   return 0
 }
 
-# -> status 0 when every account in $UPDATE_ACCOUNTS is idle; prints "NAME is busy: reason" lines otherwise
+# -> status 0 when the Mac and every account in $UPDATE_ACCOUNTS are idle; prints "NAME is busy: reason" lines otherwise
 update_all_idle() {
-  local tmp i=0 d l n rc reason busy=0
+  local tmp i=0 d l n rc reason busy=0 idle_s
+  if [ "$UPDATE_WATCH" = 1 ]; then   # the watcher also waits while someone is using the Mac
+    if idle_s="$(user_idle_seconds 2>/dev/null)"; then
+      if [ "$idle_s" -lt $((CLAUDES_IDLE_MINUTES * 60)) ]; then
+        echo "The Mac is busy: someone used the Mac $((idle_s / 60)) min ago"
+        return 1
+      fi
+    else
+      echo "The Mac is busy: can't tell if someone is using the Mac"
+      return 1
+    fi
+  fi
   [ -n "$UPDATE_ACCOUNTS" ] || return 0
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/claudes-idle.XXXXXX")"
   while IFS=$'\t' read -r d l; do
@@ -321,13 +429,12 @@ EOF
   return "$busy"
 }
 
-# -> write reopen-pending, record build and log offset, stop every open account together; status 1 if any refuses
+# -> write reopen-pending, record build and log offset, stop every open account together; status 1 if any copy is still running
 update_quit_all() {
-  local pf tmp i=0 d l n fail=0 kept=""
+  local pf tmp i=0 d l n fail=0 kept="" rc
   pf="$(update_pending_file)"
-  mkdir -p "$CLAUDES_STATE_DIR"
-  printf '%s\n' "$UPDATE_ACCOUNTS" | sed '/^$/d' > "$pf.tmp"
-  mv "$pf.tmp" "$pf"
+  _update_pending_write "$UPDATE_ACCOUNTS"
+  trap '_update_on_interrupt' INT TERM HUP
   UPDATE_OLD_BUILD="$(installed_build 2>/dev/null || true)"
   UPDATE_OLD_VERSION="$(main_version 2>/dev/null || true)"
   UPDATE_LOG_OFFSET="$(shipit_log_size 2>/dev/null || echo 0)"
@@ -347,19 +454,22 @@ EOF
   while IFS=$'\t' read -r d l; do
     [ -n "$d" ] || continue
     i=$((i + 1))
-    if [ "$(cat "$tmp/$i.rc" 2>/dev/null || echo 1)" != 0 ]; then
-      n="$(update_account_name "$d" "$l")"
+    rc="$(cat "$tmp/$i.rc" 2>/dev/null || echo 1)"
+    n="$(update_account_name "$d" "$l")"
+    # "closed" means the main Claude process is gone; leftover helpers are only a warning
+    if datadir_running "$d"; then
       echo "$n would not quit, even when forced."
       fail=1
     else
       kept="$kept$d"$'\t'"$l"$'\n'
+      if [ "$rc" != 0 ]; then echo "Some leftover parts of $n are still running. Going on anyway."; fi
     fi
   done <<EOF
 $UPDATE_ACCOUNTS
 EOF
   rm -rf "$tmp"
   if [ "$fail" = 1 ]; then
-    printf '%s' "$kept" > "$pf"   # only the accounts that really closed need reopening
+    _update_pending_write "$kept" "$(_update_pending_ts)"   # every account that did close stays listed until it is back
   fi
   return "$fail"
 }
@@ -371,8 +481,11 @@ update_wait_install() {
   while :; do
     build="$(installed_build 2>/dev/null || true)"
     log="$(shipit_log_since "$UPDATE_LOG_OFFSET" 2>/dev/null || true)"
-    if { [ -n "$build" ] && [ "$build" != "$UPDATE_OLD_BUILD" ]; } \
-       || printf '%s\n' "$log" | grep -q 'Installation completed successfully'; then
+    if printf '%s\n' "$log" | grep -q 'Installation completed successfully'; then
+      return 0
+    fi
+    # a changed build alone is not enough: the installer may still be copying files
+    if [ -n "$build" ] && [ "$build" != "$UPDATE_OLD_BUILD" ] && ! shipit_waiting; then
       return 0
     fi
     hits="$(printf '%s\n' "$log" | grep -E 'Aborting update attempt|Installation cancelled|Installation error|Too many attempts' || true)"
@@ -398,23 +511,23 @@ update_wait_install() {
 
 # -> stop the plain copy ShipIt relaunches when it is not wanted; status 0
 update_close_plain_relaunch() {
-  local def="$CLAUDES_SUPPORT_DIR/Claude" pf waited=0 d l in_pending=0 launcher=""
-  pf="$(update_pending_file)"
-  while [ "$waited" -lt 20 ]; do
-    if shipit_log_since "$UPDATE_LOG_OFFSET" 2>/dev/null | grep -q 'Successfully launched application' \
-       || datadir_running "$def"; then
-      break
+  local def="$CLAUDES_SUPPORT_DIR/Claude" waited=0 seen_at="" d l in_pending=0 launcher=""
+  # wait for the plain copy: up to 10 more seconds after the installer says it launched Claude
+  while [ "$waited" -lt 30 ]; do
+    if datadir_running "$def"; then break; fi
+    if [ -z "$seen_at" ] && shipit_log_since "$UPDATE_LOG_OFFSET" 2>/dev/null | grep -q 'Successfully launched application'; then
+      seen_at="$waited"
     fi
+    if [ -n "$seen_at" ] && [ $((waited - seen_at)) -ge 10 ]; then break; fi
+    if [ -z "$seen_at" ] && [ "$waited" -ge 20 ]; then break; fi
     claudes_sleep 2
     waited=$((waited + 2))
   done
   datadir_running "$def" || return 0
 
-  if [ -f "$pf" ]; then
-    while IFS=$'\t' read -r d l; do
-      if [ "$d" = "$def" ]; then in_pending=1; launcher="$l"; fi
-    done < "$pf"
-  fi
+  while IFS=$'\t' read -r d l; do
+    if [ "$d" = "$def" ]; then in_pending=1; launcher="$l"; fi
+  done < <(update_pending_accounts)
   [ -n "$launcher" ] || launcher="$(launcher_for "$def" 2>/dev/null || true)"
 
   # a plain copy is only wanted when the default folder was open before and has no launcher
@@ -429,9 +542,12 @@ update_close_plain_relaunch() {
   return 0
 }
 
-# FILE -> reopen every DATADIR<TAB>LAUNCHER line in FILE and confirm each is running; status 1 if any did not come up
+# FILE -> reopen every DATADIR<TAB>LAUNCHER line in FILE and confirm each is running.
+#    Status 1 if any did not come up; those are listed in $UPDATE_NOTBACK.
 _update_reopen_file() {
-  local f="$1" d l n first=1 tries fail=0
+  local f="$1" d l n first=1 tries failed="" nl
+  nl=$'\n'
+  UPDATE_NOTBACK=""
   while IFS=$'\t' read -r d l; do
     [ -n "$d" ] || continue
     n="$(update_account_name "$d" "$l")"
@@ -443,13 +559,13 @@ _update_reopen_file() {
     first=0
     if [ -n "$l" ]; then
       echo "Reopening $n from its launcher."
-      claudes_open "$l" </dev/null || { echo "Could not open $n."; fail=1; }
+      claudes_open "$l" </dev/null || { echo "Could not open $n."; failed="$failed$d$nl"; }
     elif [ "$d" = "$CLAUDES_SUPPORT_DIR/Claude" ]; then
       echo "Reopening Claude (plain, no launcher)."
-      claudes_open "$CLAUDES_APP_SRC" </dev/null || { echo "Could not open Claude."; fail=1; }
+      claudes_open -n -a "$CLAUDES_APP_SRC" </dev/null || { echo "Could not open Claude."; failed="$failed$d$nl"; }
     else
       echo "Reopening $n. It has no launcher, so its Dock icon will be the plain Claude icon."
-      claudes_open -n -a "$CLAUDES_APP_SRC" --args "--user-data-dir=$d" </dev/null || { echo "Could not open $n."; fail=1; }
+      claudes_open -n -a "$CLAUDES_APP_SRC" --args "--user-data-dir=$d" </dev/null || { echo "Could not open $n."; failed="$failed$d$nl"; }
     fi
   done < "$f"
 
@@ -458,33 +574,62 @@ _update_reopen_file() {
     n="$(update_account_name "$d" "$l")"
     tries=0
     while ! datadir_running "$d"; do
-      if [ "$tries" -ge 15 ]; then
-        echo "$n did not come back up. Open it yourself from the Dock or Launchpad."
-        fail=1
+      if [ "$tries" -ge 15 ] || { case "$nl$failed" in *"$nl$d$nl"*) true;; *) false;; esac; }; then
+        echo "$n did not come back up."
+        UPDATE_NOTBACK="$UPDATE_NOTBACK$d"$'\t'"$l"$'\n'
         break
       fi
       claudes_sleep 2
       tries=$((tries + 1))
     done
   done < "$f"
-  return "$fail"
+  [ -z "$UPDATE_NOTBACK" ]
 }
 
-# -> reopen every account in reopen-pending and confirm each is running; status 1 if any did not come up
+# -> reopen every account in reopen-pending and confirm each is running; status 1 if any did not come up.
+#    Accounts that did not come up stay in reopen-pending (3 tries, then dropped).
 update_reopen_accounts() {
-  local pf rc=0
+  local pf accounts tmp d l t keep="" tries_lines="" ts
   pf="$(update_pending_file)"
   [ -f "$pf" ] || return 0
-  _update_reopen_file "$pf" || rc=1
-  rm -f "$pf"
-  return "$rc"
+  accounts="$(update_pending_accounts)"
+  if [ -z "$accounts" ]; then rm -f "$pf"; return 0; fi
+  ts="$(_update_pending_ts)"
+  tmp="$(mktemp "$CLAUDES_STATE_DIR/reopen-list.XXXXXX")"
+  printf '%s\n' "$accounts" > "$tmp"
+  _update_reopen_file "$tmp" || true
+  rm -f "$tmp"
+  if [ -z "$UPDATE_NOTBACK" ]; then rm -f "$pf"; return 0; fi
+
+  while IFS=$'\t' read -r d l; do
+    [ -n "$d" ] || continue
+    t=$(( $(_update_pending_tries "$d") + 1 ))
+    if [ "$t" -ge 3 ]; then
+      echo "Giving up on $(update_account_name "$d" "$l") after 3 tries. Open it yourself from the Dock or Launchpad."
+    else
+      keep="$keep$d"$'\t'"$l"$'\n'
+      tries_lines="$tries_lines#tries"$'\t'"$d"$'\t'"$t"$'\n'
+    fi
+  done <<EOF
+$UPDATE_NOTBACK
+EOF
+  if [ -n "$keep" ]; then
+    _update_pending_write "$keep" "$ts" "$tries_lines"
+    echo "Kept it on the list; the next claudes update will try again."
+  else
+    rm -f "$pf"
+  fi
+  if [ "$UPDATE_WATCH" = 1 ]; then
+    claudes_notify "Could not reopen: $(update_names_of "$UPDATE_NOTBACK"). Open it from the Dock."
+  fi
+  return 1
 }
 
 # -> reopen accounts that quit for an update but never came back; status 0
 update_safety_net() {
   local d l age n tmp="" state found=0
   state="$(update_state 2>/dev/null || true)"
-  if [ "$state" = waiting ]; then return 0; fi
+  if [ "$state" = waiting ] || shipit_waiting; then return 0; fi
   if [ "$UPDATE_DRY" != 1 ]; then
     mkdir -p "$CLAUDES_STATE_DIR"
     tmp="$(mktemp "$CLAUDES_STATE_DIR/reopen-net.XXXXXX")"
@@ -509,7 +654,11 @@ update_safety_net() {
   if [ "$UPDATE_DRY" = 1 ]; then
     if [ "$found" = 0 ]; then echo "  none"; fi
   else
-    if [ "$found" = 1 ]; then _update_reopen_file "$tmp" || true; fi
+    if [ "$found" = 1 ]; then
+      if ! _update_reopen_file "$tmp" && [ "$UPDATE_WATCH" = 1 ]; then
+        claudes_notify "Could not reopen: $(update_names_of "$UPDATE_NOTBACK"). Open it from the Dock."
+      fi
+    fi
     rm -f "$tmp"
   fi
   return 0

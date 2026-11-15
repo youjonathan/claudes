@@ -249,3 +249,15 @@ stopfix() {
 @test "no pgrep or pkill remains in procs.sh or instance.sh" {
   ! grep -nE 'pgrep|pkill' "$REPO/lib/procs.sh" "$REPO/lib/instance.sh"
 }
+
+@test "stop_datadir does not KILL a pid whose command line changed (reused pid)" {
+  stopfix
+  : > "$CASCADE"
+  echo 101 >> "$STUCK"           # helper ignores TERM
+  claudes_sleep() {              # while we wait, pid 101 exits and the number is reused by another program
+    sed -i.bak 's|^ *101 .*|101 1 /usr/bin/some-other-program --unrelated|' "$PSFIX"
+  }
+  run stop_datadir "$SUP/Work" 2
+  [ "$status" -eq 0 ]
+  ! grep -q '^KILL 101$' "$KILLLOG"
+}

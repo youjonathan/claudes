@@ -209,6 +209,17 @@ account_idle() {
     fi
   fi
 
+  if [ -d "$dir/local-agent-mode-sessions" ]; then   # Cowork
+    newest="$(find "$dir/local-agent-mode-sessions" -type f -mmin "-$CLAUDES_IDLE_MINUTES" \
+      -exec stat -f %m {} + 2>/dev/null | sort -n | tail -n 1 || true)"
+    if [ -n "$newest" ]; then
+      mins=$(( ($(date +%s) - newest) / 60 ))
+      [ "$mins" -lt 0 ] && mins=0
+      echo "Cowork files changed $mins min ago"
+      return 1
+    fi
+  fi
+
   c1="$(claude_code_cpu_seconds "$pid")"
   claudes_sleep "$CLAUDES_CPU_SAMPLE"
   c2="$(claude_code_cpu_seconds "$pid")"
@@ -218,6 +229,14 @@ account_idle() {
     return 1
   fi
   return 0
+}
+
+# -> whole seconds since the last keyboard/mouse use (HIDIdleTime from ioreg); status 1 if it can't be read
+user_idle_seconds() {
+  local ns
+  ns="$(ioreg -c IOHIDSystem -d 4 2>/dev/null | awk '/"HIDIdleTime"/ { print $NF; exit }' || true)"
+  case "$ns" in ''|*[!0-9]*) return 1;; esac
+  echo $((ns / 1000000000))
 }
 
 # [PID] -> status 0 when this process (or PID) has a Claude main process as an ancestor
