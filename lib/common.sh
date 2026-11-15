@@ -17,11 +17,16 @@ CLAUDES_CPU_SAMPLE="${CLAUDES_CPU_SAMPLE:-20}"
 CLAUDES_CPU_IDLE="${CLAUDES_CPU_IDLE:-2}"              # cpu-seconds allowed in the sample
 CLAUDES_STOP_TIMEOUT="${CLAUDES_STOP_TIMEOUT:-30}"
 CLAUDES_INSTALL_TIMEOUT="${CLAUDES_INSTALL_TIMEOUT:-300}"
-CLAUDES_MAX_WAIT="${CLAUDES_MAX_WAIT:-14400}"
 CLAUDES_MARKER_GRACE="${CLAUDES_MARKER_GRACE:-300}"
 CLAUDES_MARKER_MAX_AGE="${CLAUDES_MARKER_MAX_AGE:-43200}"
 
 claudes_sleep() { sleep "$1"; }   # wrapper so tests can stub it
+
+# -> the plain-English warning shown when Claude's own updater is not blocked
+claudes_block_off_text() {
+  echo "Claude's own updater is on, so Claude may close accounts by itself when an update arrives; claudes still works."
+  echo "To stop that, install the block profile."
+}
 
 is_legacy_instance() { # $1: suffix — exit 0 if an old full-copy clone (has Claude-bin)
   [ -e "$CLAUDES_APPS_DIR/Claude ${1}.app/Contents/MacOS/Claude-bin" ]

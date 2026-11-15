@@ -21,17 +21,15 @@ cmd_watch() {
   esac
 }
 
-# -> write the LaunchAgent plist and load it; refuses if auto-updates are blocked
+# -> write the LaunchAgent plist and load it; warns when Claude's own updater is not blocked
 watch_on() {
   if [ -z "${SELF:-}" ]; then
     echo "claudes: cannot tell where claudes is installed (SELF is unset); run it as 'claudes watch on'" >&2
     return 1
   fi
-  local blocked
-  if blocked="$(auto_updates_blocked)"; then
-    echo "Claude's own updater is switched off by $blocked (disableAutoUpdates)."
-    echo "The background helper needs Claude's updater on, so it was not installed."
-    return 1
+  if ! auto_updates_blocked >/dev/null; then
+    claudes_block_off_text
+    echo
   fi
   local plist logf script
   plist="$(_watch_plist)"; logf="$(_watch_log)"; script="$SELF/claudes"
