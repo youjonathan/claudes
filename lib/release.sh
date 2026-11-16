@@ -8,7 +8,7 @@ CLAUDES_STATE_DIR="${CLAUDES_STATE_DIR:-$HOME/Library/Application Support/claude
 CLAUDES_FEED_BASE="${CLAUDES_FEED_BASE:-https://api.anthropic.com}"
 CLAUDES_RELEASE_CHECK_EVERY="${CLAUDES_RELEASE_CHECK_EVERY:-3600}"
 CLAUDES_RETRY_FAILED="${CLAUDES_RETRY_FAILED:-21600}"
-CLAUDES_TEAM_ID="${CLAUDES_TEAM_ID:-Q6L2SF6YDW}"   # used only if the installed app's Team ID can't be read
+CLAUDES_TEAM_ID="${CLAUDES_TEAM_ID:-Q6L2SF6YDW}"   # Anthropic's Team ID; downloads must be signed by it (env override is for tests)
 
 # -> epoch seconds (claudes_now when procs.sh is loaded)
 _rel_now() { if declare -F claudes_now >/dev/null 2>&1; then claudes_now; else date +%s; fi; }
@@ -44,6 +44,33 @@ _rel_kv_write() {
   mv "$tmp" "$f"
 }
 
+# VERSION -> status 0 when it is only digits and dots (it becomes a folder name, so nothing else is allowed)
+_rel_valid_version() {
+  case "$1" in ''|*[!0-9.]*|.*|*.|*..*) return 1;; esac
+  return 0
+}
+
+# VALUE -> status 0 when it has no tab, newline or carriage return (the saved files are tab-separated lines)
+_rel_clean_field() {
+  case "$1" in *$'\t'*|*$'\n'*|*$'\r'*) return 1;; esac
+  return 0
+}
+
+# PATH... -> rm -rf, but only paths inside the download folder with no .. part; anything else is refused
+_rel_rm_rf() {
+  local p base="$CLAUDES_STATE_DIR/download/"
+  for p in "$@"; do
+    case "$p" in
+      "$base"?*) ;;
+      *) echo "claudes: refusing to delete outside the download folder: $p" >&2; return 1;;
+    esac
+    case "/$p/" in
+      */../*|*/./*) echo "claudes: refusing to delete a path with .. in it: $p" >&2; return 1;;
+    esac
+  done
+  rm -rf "$@"
+}
+
 # -> the address to ask Claude's update service, with a fresh random id (never Claude's real device id)
 release_feed_url() {
   local id ver os
@@ -61,7 +88,7 @@ release_fetch_feed() {
   local url tmp cur i v="" u="" sha="" size="" f="$CLAUDES_STATE_DIR/release-check" prev first now
   url="$(release_feed_url)"
   tmp="$(mktemp "${TMPDIR:-/tmp}/claudes-feed.XXXXXX")" || { echo "could not make a temporary file to check for updates" >&2; return 1; }
-  if ! curl -fsS --proto =https --max-time 30 -A claudes-update-check -o "$tmp" "$url" 2>/dev/null; then
+  if ! curl -fsS --globoff --proto =https --connect-timeout 30 --max-time 60 -A claudes-update-check -o "$tmp" "$url" 2>/dev/null; then
     rm -f "$tmp"
     echo "could not reach Claude's update service (no internet, or the service is down)" >&2
     return 1
@@ -81,6 +108,16 @@ release_fetch_feed() {
   fi
   rm -f "$tmp"
   if [ -z "$cur" ] || [ -z "$u" ] || [ -z "$sha" ] || [ -z "$size" ]; then
+    echo "Claude's update service gave an answer claudes does not understand" >&2
+    return 1
+  fi
+  if ! _rel_valid_version "$cur" || ! _rel_clean_field "$u" || ! _rel_clean_field "$sha" || ! _rel_clean_field "$size"; then
+    echo "Claude's update service gave an answer claudes does not understand" >&2
+    return 1
+  fi
+  case "$sha" in *[!0-9a-fA-F]*) sha="";; esac
+  case "$size" in *[!0-9]*) size="";; esac
+  if [ "${#sha}" -ne 64 ] || [ -z "$size" ]; then
     echo "Claude's update service gave an answer claudes does not understand" >&2
     return 1
   fi
@@ -124,14 +161,12 @@ release_is_newer() {
 
 # PATH VERSION -> status 0 when the downloaded app is genuine Claude, intact and newer; else one plain reason and status 1
 release_verify_app() {
-  local app="$1" want="$2" team_ok id team build ib out
+  local app="$1" want="$2" id team build ib out
   [ -d "$app" ] || { echo "the downloaded Claude app is missing"; return 1; }
-  if ! codesign --verify --deep --strict "$app" >/dev/null 2>&1; then
+  if ! codesign --verify --deep --strict -R="anchor apple generic and certificate leaf[subject.OU] = \"$CLAUDES_TEAM_ID\"" "$app" >/dev/null 2>&1; then
     echo "the downloaded Claude app's signature is damaged or incomplete"
     return 1
   fi
-  team_ok="$(codesign -dv "$CLAUDES_APP_SRC" 2>&1 | sed -n 's/^TeamIdentifier=//p' | head -n 1 || true)"
-  case "$team_ok" in ''|"not set") team_ok="$CLAUDES_TEAM_ID";; esac
   out="$(codesign -dv "$app" 2>&1 || true)"
   id="$(printf '%s\n' "$out" | sed -n 's/^Identifier=//p' | head -n 1)"
   team="$(printf '%s\n' "$out" | sed -n 's/^TeamIdentifier=//p' | head -n 1)"
@@ -139,8 +174,8 @@ release_verify_app() {
     echo "the download is not the Claude app (it says it is '${id:-unknown}')"
     return 1
   fi
-  if [ "$team" != "$team_ok" ]; then
-    echo "the download was signed by a different developer than your installed Claude"
+  if [ "$team" != "$CLAUDES_TEAM_ID" ]; then
+    echo "the download was not signed by Anthropic"
     return 1
   fi
   if ! spctl --assess --type execute "$app" >/dev/null 2>&1; then
@@ -162,7 +197,7 @@ release_verify_app() {
 
 # VERSION REASON -> clean up after a failed download: delete its folder and ready, record release-failed, print the reason, status 1
 _rel_fail() {
-  rm -rf "$CLAUDES_STATE_DIR/download/$1"
+  _rel_rm_rf "$CLAUDES_STATE_DIR/download/$1" || true
   rm -f "$CLAUDES_STATE_DIR/ready"
   _rel_kv_write "$CLAUDES_STATE_DIR/release-failed" version "$1" reason "$2" at "$(_rel_now)" || true
   printf '%s\n' "$2"
@@ -171,15 +206,23 @@ _rel_fail() {
 
 # -> download and verify the newest release into ready; status 0 when a verified update is waiting, else reason and 1
 release_prepare() {
-  local s="$CLAUDES_STATE_DIR" v url sha size dir zip app rv fv fat age first got n reason apps now
+  local s="$CLAUDES_STATE_DIR" v url sha size dir zip app rv fv fat age first got n reason apps now mt
   v="$(release_check)" || return 1
+  _rel_valid_version "$v" || { echo "the saved version number is not one claudes trusts"; return 1; }
   dir="$s/download/$v"
   now="$(_rel_now)"
 
   rv="$(_rel_kv_get "$s/ready" version || true)"
   if [ "$rv" = "$v" ]; then
     app="$(release_ready_app || true)"
-    if [ -n "$app" ] && release_verify_app "$app" "$v" >/dev/null 2>&1; then return 0; fi
+    if [ -n "$app" ]; then
+      mt="$(stat -f %m "$app" 2>/dev/null || true)"
+      if [ -n "$mt" ] && [ "$(_rel_kv_get "$s/ready" app_mtime || true)" = "$mt" ]; then return 0; fi
+      if release_verify_app "$app" "$v" >/dev/null 2>&1; then
+        [ -z "$mt" ] || release_ready_set app_mtime "$mt" || true
+        return 0
+      fi
+    fi
   fi
 
   fv="$(_rel_kv_get "$s/release-failed" version || true)"
@@ -211,13 +254,13 @@ release_prepare() {
 
   [ "$rv" = "$v" ] || rm -f "$s/ready"
   if [ -d "$s/download" ]; then
-    find "$s/download" -mindepth 1 -maxdepth 1 ! -name "$v" -exec rm -rf {} + 2>/dev/null || true
+    while IFS= read -r -d '' n; do _rel_rm_rf "$n" || true; done < <(find "$s/download" -mindepth 1 -maxdepth 1 ! -name "$v" -print0 2>/dev/null)
   fi
-  rm -rf "$dir"
+  _rel_rm_rf "$dir" || { _rel_fail "$v" "could not clear the old download folder"; return 1; }
   mkdir -p "$dir/app" || { _rel_fail "$v" "could not make a folder for the download"; return 1; }
   zip="$dir/Claude.zip"
 
-  if ! curl -fsS --proto =https -o "$zip.part" "$url" 2>/dev/null; then
+  if ! curl -fsS --globoff --proto =https --connect-timeout 30 --speed-limit 1024 --speed-time 120 -o "$zip.part" "$url" 2>/dev/null; then
     _rel_fail "$v" "the download of Claude $v did not finish"; return 1
   fi
   mv "$zip.part" "$zip" || { _rel_fail "$v" "could not save the download"; return 1; }
@@ -247,7 +290,8 @@ release_prepare() {
   if [ -n "$reason" ]; then _rel_fail "$v" "$reason"; return 1; fi
 
   rm -f "$s/release-failed"
-  _rel_kv_write "$s/ready" version "$v" app "$app" verified "$(_rel_now)" first_seen "$first"
+  mt="$(stat -f %m "$app" 2>/dev/null || true)"
+  _rel_kv_write "$s/ready" version "$v" app "$app" verified "$(_rel_now)" first_seen "$first" app_mtime "$mt"
 }
 
 # -> version of the verified update waiting; status 1 if none

@@ -42,10 +42,10 @@ write_stubs() {
   cat > "$T/bin/curl" <<'EOS'
 #!/bin/bash
 echo "$*" >> "$T/curl.log"
-[ -z "${STUB_CURL_FAIL:-}" ] || exit 22
+[ -z "${STUB_CURL_FAIL:-}" ] || exit "${STUB_CURL_FAIL}"
 out="" url=""
 while [ $# -gt 0 ]; do
-  case "$1" in -o) out="$2"; shift;; -A|--max-time|--proto) shift;; -*) ;; *) url="$1";; esac
+  case "$1" in -o) out="$2"; shift;; -A|--max-time|--proto|--connect-timeout|--speed-limit|--speed-time) shift;; -*) ;; *) url="$1";; esac
   shift
 done
 case "$url" in
@@ -68,6 +68,7 @@ exit 0
 EOS
   cat > "$T/bin/codesign" <<'EOS'
 #!/bin/bash
+echo "$*" >> "$T/codesign.log"
 case "$1" in
   --verify) [ -z "${STUB_VERIFY_FAIL:-}" ] || { echo "invalid signature" >&2; exit 1; }; exit 0;;
   -dv)
@@ -160,12 +161,12 @@ assert_failed_clean() { # version : discarded, failure recorded, never ready
 
 @test "fetch picks the release named by currentRelease among several" {
   cat > "$T/feed.json" <<EOS
-{"currentRelease":"5.2.0","releases":[{"version":"5.1.0","updateTo":{"url":"https://downloads.claude.ai/a.zip","sha256":"11","size":1}},{"version":"5.2.0","updateTo":{"url":"https://downloads.claude.ai/b.zip","sha256":"22","size":2}}]}
+{"currentRelease":"5.2.0","releases":[{"version":"5.1.0","updateTo":{"url":"https://downloads.claude.ai/a.zip","sha256":"1111111111111111111111111111111111111111111111111111111111111111","size":1}},{"version":"5.2.0","updateTo":{"url":"https://downloads.claude.ai/b.zip","sha256":"2222222222222222222222222222222222222222222222222222222222222222","size":2}}]}
 EOS
   run release_fetch_feed
   [ "$status" -eq 0 ]
   [ "$(_rel_kv_get "$T/state/release-check" url)" = "https://downloads.claude.ai/b.zip" ]
-  [ "$(_rel_kv_get "$T/state/release-check" sha256)" = "22" ]
+  [ "$(_rel_kv_get "$T/state/release-check" sha256)" = "2222222222222222222222222222222222222222222222222222222222222222" ]
 }
 
 @test "fetch refuses a download address outside downloads.claude.ai" {
@@ -297,7 +298,7 @@ EOS
   export STUB_NEW_TEAM=EVIL000000
   run release_verify_app "$T/zipcontent/Claude.app" "$NEWV"
   [ "$status" -eq 1 ]
-  [[ "$output" == *"different developer"* ]]
+  [[ "$output" == *"not signed by Anthropic"* ]]
 }
 
 @test "verify fails on a different bundle id" {
@@ -327,11 +328,15 @@ EOS
   [[ "$output" == *"not newer"* ]]
 }
 
-@test "verify uses CLAUDES_TEAM_ID when the installed app's team can't be read" {
-  export STUB_OLD_TEAM=none
+@test "verify pins the requirement to Anthropic's Team ID, not the installed app's" {
+  export STUB_OLD_TEAM=EVIL000000
   run release_verify_app "$T/zipcontent/Claude.app" "$NEWV"
   [ "$status" -eq 0 ]
-  export STUB_NEW_TEAM=EVIL000000
+  grep -qF -- '--verify --deep --strict -R=anchor apple generic and certificate leaf[subject.OU] = "Q6L2SF6YDW" ' "$T/codesign.log"
+}
+
+@test "verify fails when the installed app's team differs from the pinned one but the download matches the installed" {
+  export STUB_OLD_TEAM=EVIL000000 STUB_NEW_TEAM=EVIL000000
   run release_verify_app "$T/zipcontent/Claude.app" "$NEWV"
   [ "$status" -eq 1 ]
 }
@@ -563,4 +568,121 @@ EOS
 @test "release_discard is fine when there is nothing to remove" {
   run release_discard
   [ "$status" -eq 0 ]
+}
+
+# ---- hostile feed answers ----
+mkhostile() { # field value : feed whose chosen field carries the value (JSON-escaped by the caller)
+  local v="$NEWV" u="https://downloads.claude.ai/a.zip" sha="$SHA" size="$ZIPSIZE"
+  case "$1" in version) v="$2";; url) u="$2";; sha) sha="$2";; size) size="$2";; esac
+  printf '{"currentRelease":"%s","releases":[{"version":"%s","updateTo":{"url":"%s","sha256":"%s","size":%s}}]}\n' "$v" "$v" "$u" "$sha" "$size" > "$T/feed.json"
+}
+
+@test "fetch rejects hostile version strings and writes nothing" {
+  for bad in '9/../../../../../Documents' '5.1 .0' '5.1.0\n../x' '../5' '5..1' '.5' '5.' 'v5.1' '5.1.0-beta' '5.1.0/'; do
+    rm -f "$T/state/release-check"
+    mkhostile version "$bad"
+    run release_fetch_feed
+    [ "$status" -eq 1 ]
+    [ ! -e "$T/state/release-check" ]
+  done
+}
+
+@test "fetch rejects tabs, newlines and returns in url, checksum and size" {
+  for bad in 'x\ty' 'x\ny' 'x\ry'; do
+    mkhostile url "https://downloads.claude.ai/$bad"
+    run release_fetch_feed; [ "$status" -eq 1 ]; [ ! -e "$T/state/release-check" ]
+    mkhostile sha "${SHA:0:60}$bad"
+    run release_fetch_feed; [ "$status" -eq 1 ]; [ ! -e "$T/state/release-check" ]
+  done
+}
+
+@test "fetch rejects a checksum that is not 64 hex characters" {
+  for bad in "abc" "${SHA}00" "${SHA:0:63}g"; do
+    mkhostile sha "$bad"
+    run release_fetch_feed; [ "$status" -eq 1 ]; [ ! -e "$T/state/release-check" ]
+  done
+}
+
+@test "fetch rejects a size that is not digits" {
+  mkhostile size '"12abc"'
+  run release_fetch_feed; [ "$status" -eq 1 ]; [ ! -e "$T/state/release-check" ]
+}
+
+@test "prepare refuses a hostile saved version and deletes nothing" {
+  mkdir -p "$T/victim"; touch "$T/victim/keep"
+  mkcache "$(date +%s)" "9/../../../victim"
+  run release_prepare
+  [ "$status" -eq 1 ]
+  [ -f "$T/victim/keep" ]
+  [ ! -e "$T/ditto.log" ]
+}
+
+@test "_rel_rm_rf refuses paths outside the download folder or with .. in them" {
+  mkdir -p "$T/state/download/a" "$T/victim"; touch "$T/victim/keep"
+  run _rel_rm_rf "$T/victim"
+  [ "$status" -eq 1 ]
+  run _rel_rm_rf "$T/state/download/../../victim"
+  [ "$status" -eq 1 ]
+  run _rel_rm_rf "$T/state/download/a/../../../victim"
+  [ "$status" -eq 1 ]
+  run _rel_rm_rf "$T/state/download/"
+  [ "$status" -eq 1 ]
+  [ -f "$T/victim/keep" ]
+  [ -d "$T/state/download/a" ]
+  run _rel_rm_rf "$T/state/download/a"
+  [ "$status" -eq 0 ]
+  [ ! -e "$T/state/download/a" ]
+}
+
+# ---- curl limits ----
+@test "feed request is time-limited and globbing is off" {
+  mkfeed
+  release_fetch_feed
+  grep -q -- '--globoff' "$T/curl.log"
+  grep -q -- '--connect-timeout 30' "$T/curl.log"
+  grep -q -- '--max-time 60' "$T/curl.log"
+}
+
+@test "download has globoff, connect timeout and a stall guard" {
+  fresh_cache
+  release_prepare
+  line="$(grep 'Claude-abc123.zip' "$T/curl.log")"
+  [[ "$line" == *"--globoff"* ]]
+  [[ "$line" == *"--connect-timeout 30"* ]]
+  [[ "$line" == *"--speed-limit 1024 --speed-time 120"* ]]
+}
+
+@test "a stalled download (curl gives up) goes through the failure path" {
+  fresh_cache
+  export STUB_CURL_FAIL=28
+  run release_prepare
+  [ "$status" -eq 1 ]
+  assert_failed_clean "$NEWV"
+}
+
+# ---- ready record skip ----
+@test "prepare writes the app's modification time into ready" {
+  fresh_cache
+  release_prepare
+  [ "$(release_ready_get app_mtime)" = "$(stat -f %m "$T/state/download/$NEWV/app/Claude.app")" ]
+}
+
+@test "prepare skips the deep re-check when version and modification time match" {
+  fresh_cache
+  release_prepare
+  : > "$T/codesign.log"
+  run release_prepare
+  [ "$status" -eq 0 ]
+  [ ! -s "$T/codesign.log" ]
+}
+
+@test "prepare re-checks when the app folder changed since it was verified" {
+  fresh_cache
+  release_prepare
+  : > "$T/codesign.log"
+  touch -t 202001010000 "$T/state/download/$NEWV/app/Claude.app"
+  run release_prepare
+  [ "$status" -eq 0 ]
+  [ -s "$T/codesign.log" ]
+  [ "$(release_ready_get app_mtime)" = "$(stat -f %m "$T/state/download/$NEWV/app/Claude.app")" ]
 }
