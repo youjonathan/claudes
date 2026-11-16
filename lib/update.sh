@@ -284,7 +284,7 @@ _update_run_release() {
     if [ -n "$UPDATE_BLOCKED_FILE" ]; then
       echo "Claude's own updater: blocked by $UPDATE_BLOCKED_FILE (expected)"
     else
-      echo "Claude's own updater: ON, so Claude may close accounts by itself. To stop that, install the block profile."
+      echo "Claude's own updater: ON, so Claude may close accounts by itself. To stop that, install the block profile. It is docs/block-claude-updates.mobileconfig (see README)."
     fi
     if [ "$dry_rc" = 2 ]; then
       echo "Could not find out the newest Claude version (no internet?)."

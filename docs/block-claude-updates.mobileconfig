@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>PayloadType</key>
+  <string>Configuration</string>
+  <key>PayloadVersion</key>
+  <integer>1</integer>
+  <key>PayloadIdentifier</key>
+  <string>io.github.claudes.block-claude-updates</string>
+  <key>PayloadUUID</key>
+  <string>FA754C14-6BC6-4B07-968D-1028B6EFF3ED</string>
+  <key>PayloadDisplayName</key>
+  <string>Block Claude Desktop auto-updates (claudes)</string>
+  <key>PayloadDescription</key>
+  <string>Turns off Claude Desktop's own auto-updater so that claudes update installs new versions when every open account is idle.</string>
+  <key>PayloadOrganization</key>
+  <string>claudes</string>
+  <key>PayloadScope</key>
+  <string>System</string>
+  <key>PayloadRemovalDisallowed</key>
+  <false/>
+  <key>PayloadContent</key>
+  <array>
+    <dict>
+      <key>PayloadType</key>
+      <string>com.apple.ManagedClient.preferences</string>
+      <key>PayloadVersion</key>
+      <integer>1</integer>
+      <key>PayloadIdentifier</key>
+      <string>io.github.claudes.block-claude-updates.preferences</string>
+      <key>PayloadUUID</key>
+      <string>75AEB503-3BC0-4EB7-8CC2-33F2CBDD4779</string>
+      <key>PayloadDisplayName</key>
+      <string>Claude Desktop: disableAutoUpdates</string>
+      <key>PayloadEnabled</key>
+      <true/>
+      <key>PayloadContent</key>
+      <dict>
+        <key>com.anthropic.claudefordesktop</key>
+        <dict>
+          <key>Forced</key>
+          <array>
+            <dict>
+              <key>mcx_preference_settings</key>
+              <dict>
+                <key>disableAutoUpdates</key>
+                <true/>
+              </dict>
+            </dict>
+          </array>
+        </dict>
+      </dict>
+    </dict>
+  </array>
+</dict>
+</plist>

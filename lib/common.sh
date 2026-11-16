@@ -25,7 +25,7 @@ claudes_sleep() { sleep "$1"; }   # wrapper so tests can stub it
 # -> the plain-English warning shown when Claude's own updater is not blocked
 claudes_block_off_text() {
   echo "Claude's own updater is on, so Claude may close accounts by itself when an update arrives; claudes still works."
-  echo "To stop that, install the block profile."
+  echo "To stop that, install the block profile. It is docs/block-claude-updates.mobileconfig (see README)."
 }
 
 is_legacy_instance() { # $1: suffix — exit 0 if an old full-copy clone (has Claude-bin)
