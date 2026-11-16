@@ -11,6 +11,7 @@ SELF="$(cd "$(dirname "$SRC")" && pwd)"
 CLAUDES_LIB="$(cd "$SELF/../lib" && pwd)"; export CLAUDES_LIB
 source "$CLAUDES_LIB/common.sh"; source "$CLAUDES_LIB/config.sh"; source "$CLAUDES_LIB/instance.sh"
 source "$CLAUDES_LIB/procs.sh"; source "$CLAUDES_LIB/update_detect.sh"
+source "$CLAUDES_LIB/release.sh"; source "$CLAUDES_LIB/install.sh"
 source "$CLAUDES_LIB/update.sh"; source "$CLAUDES_LIB/watch.sh"
 
 usage() { cat <<EOF
@@ -21,7 +22,7 @@ claudes — run multiple Claude Desktop accounts side by side (macOS)
   claudes remove <LETTER> [--purge]        delete instance (keeps profile unless --purge)
   claudes rainbow                          create R,O,Y,G,B,I,V instances
   claudes doctor                           check environment
-  claudes update [--dry-run]                install a waiting Claude update and reopen your accounts
+  claudes update [--dry-run]                download, check and install a new Claude, then reopen your accounts
   claudes watch on|off|status             background helper that runs 'update' by itself
 
 Colors: red orange yellow green teal blue indigo violet purple pink, or 0-255.

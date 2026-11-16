@@ -12,6 +12,7 @@ setup() {
   export CLAUDES_SHIPIT_DIR="$T/shipit"
   export CLAUDES_MANAGED_PREFS_DIR="$T/managed"
   export CLAUDES_CONFIG="$T/config"
+  export CLAUDES_STATE_DIR="$T/state"
   export USER=tester
   export T
   export PATH="$T/bin:$PATH"
@@ -37,6 +38,9 @@ setup() {
   # the "sample window" passes: swap in the second process table if a test made one
   claudes_sleep() { if [ -f "$T/procs2" ]; then cp "$T/procs2" "$T/procs"; fi; }
   : > "$T/procs"; : > "$T/mainprocs"
+  stub_lsappinfo
+  echo 999 > "$T/front"   # some other app in front by default
+  stub_windows_bin
   set -euo pipefail   # the real script runs this way
 }
 
@@ -69,6 +73,35 @@ done < "$T/procs"
 exit 1
 EOS
   chmod +x "$T/bin/ps"
+}
+
+stub_lsappinfo() { # reads the front pid from $T/front; no file = unknown
+  cat > "$T/bin/lsappinfo" <<'EOS'
+#!/bin/bash
+[ -f "$T/front" ] || exit 1
+case "$1" in
+  front) if [ -f "$T/front-out" ]; then cat "$T/front-out"; else echo "ASN:0x0-0x1234:"; fi;;
+  info) [ "$2 $3" = "-only pid" ] && [ "$4" = "ASN:0x0-0x1234:" ] && printf '"pid"=%s\n' "$(cat "$T/front")";;
+esac
+EOS
+  chmod +x "$T/bin/lsappinfo"
+}
+stub_windows_bin() { # ready-made helper that prints $T/fs-pids; $T/fs-fail makes it fail
+  mkdir -p "$CLAUDES_STATE_DIR/bin"
+  cat > "$CLAUDES_STATE_DIR/bin/claudes-windows" <<'EOS'
+#!/bin/bash
+[ -f "$T/fs-fail" ] && exit 1
+cat "$T/fs-pids" 2>/dev/null || true
+EOS
+  chmod +x "$CLAUDES_STATE_DIR/bin/claudes-windows"
+  touch "$CLAUDES_STATE_DIR/bin/claudes-windows"
+}
+fake_now() { echo "$1" > "$T/now"; claudes_now() { cat "$T/now"; }; }
+mkrunning() { stub_ps; printf '100\t%s\n' "$(DD)" > "$T/mainprocs"; }
+mksession() { # relative-path [age-minutes]
+  local f="$(DD)/$1"
+  mkdir -p "$(dirname "$f")"; : > "$f"
+  [ -z "${2:-}" ] || touch -t "$(date -v-"$2"M +%Y%m%d%H%M.%S)" "$f"
 }
 
 # ---- installed_build / update_state ----
@@ -289,39 +322,301 @@ mkmarker() { mkdir -p "$T/dd"; printf '%s' "$1" > "$T/dd/stealth-relaunch"; }
   [ "$(ps_time_to_seconds 2-01:00:00.00)" = "176400.00" ]
 }
 
-# ---- account_idle ----
+# ---- front_app_pid / fullscreen_pids ----
 DD() { echo "$CLAUDES_SUPPORT_DIR/Claude-3p"; }
 
+@test "front_app_pid: digits of the pid lsappinfo reports" {
+  echo 15530 > "$T/front"
+  run front_app_pid
+  [ "$status" -eq 0 ]
+  [ "$output" = 15530 ]
+}
+
+@test "front_app_pid: status 2 when lsappinfo fails" {
+  rm -f "$T/front"
+  run front_app_pid
+  [ "$status" -eq 2 ]
+  [ -z "$output" ]
+}
+
+@test "front_app_pid: status 2 when lsappinfo prints nothing at all" {
+  echo 1 > "$T/front"; : > "$T/front-out"
+  run front_app_pid
+  [ "$status" -eq 2 ]
+}
+
+@test "front_app_pid: status 1 when the pid is not a number (lsappinfo works, no front app)" {
+  echo "[ NULL ]" > "$T/front"
+  run front_app_pid
+  [ "$status" -eq 1 ]
+}
+
+@test "front_app_pid: status 1 when lsappinfo works and says there is no front app" {
+  echo 1 > "$T/front"; echo "[ NULL ]" > "$T/front-out"
+  run front_app_pid
+  [ "$status" -eq 1 ]
+}
+
+@test "account_idle: lsappinfo working but reporting no front app is not busy and not logged" {
+  mkrunning
+  echo 1 > "$T/front"; echo "[ NULL ]" > "$T/front-out"
+  run account_idle "$(DD)"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  [ ! -e "$CLAUDES_LOG_DIR/update.log" ]
+}
+
+@test "account_idle: lsappinfo printing nothing is busy and logged" {
+  mkrunning
+  echo 1 > "$T/front"; : > "$T/front-out"
+  run account_idle "$(DD)"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"could not check which app is in front"* ]]
+  grep -q "could not check which app is in front" "$CLAUDES_LOG_DIR/update.log"
+}
+
+@test "_idle_log: update.log over 1 MB is cut to its last 2000 lines" {
+  mkdir -p "$CLAUDES_LOG_DIR"
+  eval "$(sed -n '/^_update_trim_log()/,/^}/p' "$REPO/lib/update.sh")"   # the real trimmer
+  awk 'BEGIN { for (i = 1; i <= 30000; i++) printf "line %d padded to make the file big enough for the limit\n", i }' > "$CLAUDES_LOG_DIR/update.log"
+  _idle_log "one more"
+  [ "$(wc -l < "$CLAUDES_LOG_DIR/update.log" | tr -d ' ')" = 2000 ]
+  [[ "$(tail -n 1 "$CLAUDES_LOG_DIR/update.log")" == *"idle check: one more" ]]
+}
+
+@test "fullscreen_pids prints what the helper prints" {
+  printf '100\n200\n' > "$T/fs-pids"
+  run fullscreen_pids
+  [ "$status" -eq 0 ]
+  [ "$output" = $'100\n200' ]
+}
+
+@test "fullscreen_pids: status 1 when the helper fails" {
+  touch "$T/fs-fail"
+  run fullscreen_pids
+  [ "$status" -eq 1 ]
+}
+
+@test "fullscreen_pids compiles the swift file once with swiftc into the state folder" {
+  rm -f "$CLAUDES_STATE_DIR/bin/claudes-windows"
+  echo '// fake' > "$T/windows.swift"
+  _UD_WINDOWS_SWIFT="$T/windows.swift"
+  cat > "$T/bin/swiftc" <<'EOS'
+#!/bin/bash
+echo x >> "$T/swiftc-calls"
+[ "$1" = -O ] && [ "$2" = -o ] && [ "$4" = "$T/windows.swift" ] || exit 2
+printf '#!/bin/bash\necho 321\n' > "$3"; chmod +x "$3"
+EOS
+  chmod +x "$T/bin/swiftc"
+  run fullscreen_pids
+  [ "$output" = 321 ]
+  run fullscreen_pids
+  [ "$output" = 321 ]
+  [ "$(wc -l < "$T/swiftc-calls" | tr -d ' ')" = 1 ]
+  [ -x "$CLAUDES_STATE_DIR/bin/claudes-windows" ]
+  # a newer swift file is compiled again
+  touch -t 203001010000 "$T/windows.swift"
+  fullscreen_pids >/dev/null
+  [ "$(wc -l < "$T/swiftc-calls" | tr -d ' ')" = 2 ]
+}
+
+@test "fullscreen_pids falls back to swift FILE when swiftc fails" {
+  rm -f "$CLAUDES_STATE_DIR/bin/claudes-windows"
+  echo '// fake' > "$T/windows.swift"
+  _UD_WINDOWS_SWIFT="$T/windows.swift"
+  printf '#!/bin/bash\nexit 1\n' > "$T/bin/swiftc"
+  printf '#!/bin/bash\n[ "$1" = "%s" ] && echo 654\n' "$T/windows.swift" > "$T/bin/swift"
+  chmod +x "$T/bin/swiftc" "$T/bin/swift"
+  run fullscreen_pids
+  [ "$status" -eq 0 ]
+  [ "$output" = 654 ]
+}
+
+@test "fullscreen_pids: status 1 when nothing can compile or run" {
+  rm -f "$CLAUDES_STATE_DIR/bin/claudes-windows"
+  echo '// fake' > "$T/windows.swift"
+  _UD_WINDOWS_SWIFT="$T/windows.swift"
+  printf '#!/bin/bash\nexit 1\n' > "$T/bin/swiftc"; cp "$T/bin/swiftc" "$T/bin/swift"
+  chmod +x "$T/bin/swiftc" "$T/bin/swift"
+  run fullscreen_pids
+  [ "$status" -eq 1 ]
+}
+
+@test "fullscreen_pids in a dry run compiles outside the state folder and leaves it untouched" {
+  rm -f "$CLAUDES_STATE_DIR/bin/claudes-windows"
+  rmdir "$CLAUDES_STATE_DIR/bin" "$CLAUDES_STATE_DIR"
+  echo '// fake' > "$T/windows.swift"
+  _UD_WINDOWS_SWIFT="$T/windows.swift"
+  cat > "$T/bin/swiftc" <<'EOS'
+#!/bin/bash
+printf '#!/bin/bash\necho 321\n' > "$3"; chmod +x "$3"
+EOS
+  chmod +x "$T/bin/swiftc"
+  CLAUDES_IDLE_READONLY=1 run fullscreen_pids
+  [ "$status" -eq 0 ]
+  [ "$output" = 321 ]
+  [ ! -e "$CLAUDES_STATE_DIR" ]
+}
+
+# ---- account_idle ----
 @test "account_idle: not running is idle" {
   stub_ps
+  echo 100 > "$T/front"
   run account_idle "$(DD)"
   [ "$status" -eq 0 ]
   [ -z "$output" ]
 }
 
-@test "account_idle: busy by recent session file" {
-  stub_ps
-  printf '100\t%s\n' "$(DD)" > "$T/mainprocs"
-  mkdir -p "$(DD)/claude-code-sessions/a"
-  touch "$(DD)/claude-code-sessions/a/s.json"
+@test "account_idle: busy when its window is in front" {
+  mkrunning
+  echo 100 > "$T/front"
   run account_idle "$(DD)"
   [ "$status" -eq 1 ]
-  [[ "$output" == "session files changed "*" min ago" ]]
+  [ "$output" = "its window is in front" ]
 }
 
-@test "account_idle: old session files do not make it busy" {
-  stub_ps
-  printf '100\t%s\n' "$(DD)" > "$T/mainprocs"
-  mkdir -p "$(DD)/claude-code-sessions/a"
-  touch -t 202001010000 "$(DD)/claude-code-sessions/a/s.json"
-  printf '100 1 0:10.00 %s/Contents/MacOS/Claude\n' "$CLAUDES_APP_SRC" > "$T/procs"
+@test "account_idle: another app in front is not busy" {
+  mkrunning
+  echo 999 > "$T/front"
   run account_idle "$(DD)"
   [ "$status" -eq 0 ]
 }
 
+@test "account_idle: lsappinfo failing is busy with a reason and is logged" {
+  mkrunning
+  rm -f "$T/front"
+  run account_idle "$(DD)"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"could not check which app is in front"* ]]
+  grep -q "could not check which app is in front" "$CLAUDES_LOG_DIR/update.log"
+}
+
+@test "account_idle: dry run does not count a failing lsappinfo as busy" {
+  mkrunning
+  rm -f "$T/front"
+  CLAUDES_IDLE_READONLY=1 run account_idle "$(DD)"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  [ ! -e "$CLAUDES_LOG_DIR/update.log" ]
+}
+
+@test "account_idle: busy when a window is full screen" {
+  mkrunning
+  printf '55\n100\n' > "$T/fs-pids"
+  run account_idle "$(DD)"
+  [ "$status" -eq 1 ]
+  [ "$output" = "a window is full screen" ]
+}
+
+@test "account_idle: another app full screen is not busy; pid 1000 is not pid 100" {
+  mkrunning
+  printf '55\n1000\n' > "$T/fs-pids"
+  run account_idle "$(DD)"
+  [ "$status" -eq 0 ]
+}
+
+@test "account_idle: full-screen helper failing is busy, names the fix and is logged" {
+  mkrunning
+  touch "$T/fs-fail"
+  run account_idle "$(DD)"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"could not check for full-screen windows"* ]]
+  [[ "$output" == *"xcode-select --install"* ]]
+  grep -q "xcode-select --install" "$CLAUDES_LOG_DIR/update.log"
+}
+
+@test "account_idle: dry run does not count a failing full-screen helper as busy" {
+  mkrunning
+  touch "$T/fs-fail"
+  CLAUDES_IDLE_READONLY=1 run account_idle "$(DD)"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  [ ! -e "$CLAUDES_LOG_DIR/update.log" ]
+}
+
+@test "idle_rules_report: notes both checks that cannot run and names the fix" {
+  rm -f "$T/front"; touch "$T/fs-fail"
+  run idle_rules_report
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"lsappinfo failed"* ]]
+  [[ "$output" == *"xcode-select --install"* ]]
+  [[ "$output" != *"counted as not busy"* ]]
+}
+
+@test "account_idle: busy by recent Claude Code session file" {
+  mkrunning
+  mksession claude-code-sessions/a/b/local_x.json
+  run account_idle "$(DD)"
+  [ "$status" -eq 1 ]
+  [ "$output" = "a Claude Code session was active 0 min ago" ]
+}
+
+@test "account_idle: session reason counts the minutes" {
+  mkrunning
+  mksession claude-code-sessions/a/b/local_x.json 4
+  run account_idle "$(DD)"
+  [ "$status" -eq 1 ]
+  [[ "$output" == "a Claude Code session was active "[34]" min ago" ]]
+}
+
+@test "account_idle: an old session file does not make it busy" {
+  mkrunning
+  mksession claude-code-sessions/a/b/local_x.json 30
+  run account_idle "$(DD)"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "account_idle: scheduled-tasks.json and other files in claude-code-sessions are ignored" {
+  mkrunning
+  mksession claude-code-sessions/a/b/scheduled-tasks.json
+  mksession claude-code-sessions/a/b/other.json
+  mksession claude-code-sessions/a/b/local_x.txt
+  run account_idle "$(DD)"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "account_idle: session files are judged by the claudes_now clock" {
+  mkrunning
+  mksession claude-code-sessions/a/b/local_x.json
+  m="$(stat -f %m "$(DD)/claude-code-sessions/a/b/local_x.json")"
+  fake_now $((m + 9 * 60 + 59))
+  run account_idle "$(DD)"
+  [ "$status" -eq 1 ]
+  [ "$output" = "a Claude Code session was active 9 min ago" ]
+  fake_now $((m + 10 * 60))
+  run account_idle "$(DD)"
+  [ "$status" -eq 0 ]
+}
+
+@test "account_idle: busy by recent Cowork session file" {
+  mkrunning
+  mksession local-agent-mode-sessions/a/b/audit.jsonl
+  run account_idle "$(DD)"
+  [ "$status" -eq 1 ]
+  [ "$output" = "a Cowork session was active 0 min ago" ]
+}
+
+@test "account_idle: old Cowork files do not make it busy" {
+  mkrunning
+  mksession local-agent-mode-sessions/a/b/audit.jsonl 30
+  run account_idle "$(DD)"
+  [ "$status" -eq 0 ]
+}
+
+@test "account_idle: Cowork skills-plugin files and manifest.json are ignored" {
+  mkrunning
+  mksession local-agent-mode-sessions/skills-plugin/x/SKILL.md
+  mksession local-agent-mode-sessions/a/skills-plugin/y/SKILL.md
+  mksession local-agent-mode-sessions/manifest.json
+  run account_idle "$(DD)"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
 @test "account_idle: busy by CPU of Claude Code children" {
-  stub_ps
-  printf '100\t%s\n' "$(DD)" > "$T/mainprocs"
+  mkrunning
   cat > "$T/procs" <<TABLE
 100 1 5:00.00 $CLAUDES_APP_SRC/Contents/MacOS/Claude
 101 100 9:00.00 $CLAUDES_APP_SRC/Contents/Helpers/disclaimer --pgroup --
@@ -334,8 +629,7 @@ TABLE
 }
 
 @test "account_idle: idle when only Claude-owned processes burn CPU" {
-  stub_ps
-  printf '100\t%s\n' "$(DD)" > "$T/mainprocs"
+  mkrunning
   cat > "$T/procs" <<TABLE
 100 1 5:00.00 $CLAUDES_APP_SRC/Contents/MacOS/Claude
 101 100 9:00.00 $CLAUDES_APP_SRC/Contents/Helpers/disclaimer --pgroup --
@@ -345,6 +639,121 @@ TABLE
   run account_idle "$(DD)"
   [ "$status" -eq 0 ]
   [ -z "$output" ]
+}
+
+# ---- account_idle_settled ----
+IS() { echo "$CLAUDES_STATE_DIR/idle-since"; }
+
+@test "settled: first idle sighting starts the countdown and writes idle-since" {
+  mkrunning
+  fake_now 1000
+  run account_idle_settled "$(DD)"
+  [ "$status" -eq 1 ]
+  [ "$output" = "quiet for 0 of 10 minutes" ]
+  [ "$(cat "$(IS)")" = "$(printf '%s\t100\t1000' "$(DD)")" ]
+}
+
+@test "settled: countdown continues, then passes at 10 minutes" {
+  mkrunning
+  fake_now 1000
+  account_idle_settled "$(DD)" || true
+  fake_now $((1000 + 4 * 60 + 30))
+  run account_idle_settled "$(DD)"
+  [ "$status" -eq 1 ]
+  [ "$output" = "quiet for 4 of 10 minutes" ]
+  [ "$(cat "$(IS)")" = "$(printf '%s\t100\t1000' "$(DD)")" ]
+  fake_now $((1000 + 600))
+  run account_idle_settled "$(DD)"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "settled: busy removes the line and prints the reason" {
+  mkrunning
+  fake_now 1000
+  account_idle_settled "$(DD)" || true
+  printf 'other\t7\t5\n' >> "$(IS)"
+  echo 100 > "$T/front"
+  run account_idle_settled "$(DD)"
+  [ "$status" -eq 1 ]
+  [ "$output" = "its window is in front" ]
+  [ "$(cat "$(IS)")" = "$(printf 'other\t7\t5')" ]
+  # idle again afterwards: the countdown starts from zero
+  echo 999 > "$T/front"
+  fake_now 1500
+  run account_idle_settled "$(DD)"
+  [ "$output" = "quiet for 0 of 10 minutes" ]
+  [ "$(grep -c . "$(IS)")" = 2 ]
+  grep -q "^$(DD)"$'\t'"100"$'\t'"1500$" "$(IS)"
+}
+
+@test "settled: a new main pid restarts the countdown" {
+  mkrunning
+  fake_now 1000
+  account_idle_settled "$(DD)" || true
+  printf '222\t%s\n' "$(DD)" > "$T/mainprocs"
+  fake_now 1700
+  run account_idle_settled "$(DD)"
+  [ "$status" -eq 1 ]
+  [ "$output" = "quiet for 0 of 10 minutes" ]
+  [ "$(cat "$(IS)")" = "$(printf '%s\t222\t1700' "$(DD)")" ]
+}
+
+@test "settled: other accounts keep their own lines" {
+  mkrunning
+  mkdir -p "$CLAUDES_STATE_DIR"
+  printf 'other\t7\t5\n' > "$(IS)"
+  fake_now 1000
+  account_idle_settled "$(DD)" || true
+  grep -q "^other"$'\t'"7"$'\t'"5$" "$(IS)"
+  grep -q "^$(DD)"$'\t'"100"$'\t'"1000$" "$(IS)"
+}
+
+@test "settled: not running counts as settled and drops its line" {
+  stub_ps
+  mkdir -p "$CLAUDES_STATE_DIR"
+  printf '%s\t100\t1000\n' "$(DD)" > "$(IS)"
+  run account_idle_settled "$(DD)"
+  [ "$status" -eq 0 ]
+  [ ! -s "$(IS)" ]
+}
+
+@test "settled: readonly never writes or deletes idle-since" {
+  mkrunning
+  fake_now 1000
+  CLAUDES_IDLE_READONLY=1 run account_idle_settled "$(DD)"
+  [ "$status" -eq 1 ]
+  [ "$output" = "quiet for 0 of 10 minutes" ]
+  [ ! -e "$(IS)" ]
+  printf '%s\t100\t400\n' "$(DD)" > "$(IS)"
+  cp "$(IS)" "$T/before"
+  CLAUDES_IDLE_READONLY=1 run account_idle_settled "$(DD)"
+  [ "$status" -eq 0 ]
+  echo 100 > "$T/front"
+  CLAUDES_IDLE_READONLY=1 run account_idle_settled "$(DD)"
+  [ "$status" -eq 1 ]
+  [ "$output" = "its window is in front" ]
+  cmp "$(IS)" "$T/before"
+  [ ! -e "$CLAUDES_STATE_DIR/idle-since.lock" ]
+}
+
+# ---- idle_rules_report ----
+@test "idle_rules_report lists copied rules and the ones that cannot be seen" {
+  echo 5 > "$T/front"
+  run idle_rules_report
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Copied"* && "$output" == *"window is in front"* && "$output" == *"full screen"* ]]
+  [[ "$output" == *"10 quiet minutes"* && "$output" == *"CPU"* ]]
+  [[ "$output" == *"unsaved typing"* && "$output" == *"export or import"* ]]
+  [[ "$output" == *"/loop"* && "$output" == *"still streaming"* ]]
+  [[ "$output" != *"could not"* ]]
+}
+
+@test "idle_rules_report says when full screen or front app cannot be checked" {
+  touch "$T/fs-fail"
+  run idle_rules_report
+  [[ "$output" == *"could not tell which app is in front"* ]]
+  [[ "$output" == *"could not check for full-screen windows"* ]]
 }
 
 # ---- inside_claude_copy ----
@@ -375,49 +784,4 @@ TABLE
   [ "$status" -eq 1 ]
   run inside_claude_copy 401
   [ "$status" -eq 1 ]
-}
-
-@test "account_idle: busy by recent Cowork (local-agent-mode-sessions) file" {
-  stub_ps
-  printf '100\t%s\n' "$(DD)" > "$T/mainprocs"
-  mkdir -p "$(DD)/local-agent-mode-sessions/a"
-  touch "$(DD)/local-agent-mode-sessions/a/s.json"
-  run account_idle "$(DD)"
-  [ "$status" -eq 1 ]
-  [[ "$output" == "Cowork files changed "*" min ago" ]]
-}
-
-@test "account_idle: old Cowork files do not make it busy" {
-  stub_ps
-  printf '100\t%s\n' "$(DD)" > "$T/mainprocs"
-  mkdir -p "$(DD)/local-agent-mode-sessions/a"
-  touch -t 202001010000 "$(DD)/local-agent-mode-sessions/a/s.json"
-  printf '100 1 0:10.00 %s/Contents/MacOS/Claude\n' "$CLAUDES_APP_SRC" > "$T/procs"
-  run account_idle "$(DD)"
-  [ "$status" -eq 0 ]
-}
-
-@test "user_idle_seconds reads HIDIdleTime from ioreg" {
-  printf '#!/bin/bash\necho "    | |   \\"HIDIdleTime\\" = 125000000000"\n' > "$T/bin/ioreg"
-  chmod +x "$T/bin/ioreg"
-  run user_idle_seconds
-  [ "$status" -eq 0 ]
-  [ "$output" = 125 ]
-}
-
-@test "user_idle_seconds fails when ioreg gives nothing" {
-  printf '#!/bin/bash\nexit 0\n' > "$T/bin/ioreg"
-  chmod +x "$T/bin/ioreg"
-  run user_idle_seconds
-  [ "$status" -eq 1 ]
-}
-
-@test "account_idle: Cowork files under skills-plugin do not make it busy" {
-  stub_ps
-  printf '100\t%s\n' "$(DD)" > "$T/mainprocs"
-  mkdir -p "$(DD)/local-agent-mode-sessions/skills-plugin/x"
-  touch "$(DD)/local-agent-mode-sessions/skills-plugin/x/SKILL.md"
-  printf '100 1 0:10.00 %s/Contents/MacOS/Claude\n' "$CLAUDES_APP_SRC" > "$T/procs"
-  run account_idle "$(DD)"
-  [ "$status" -eq 0 ]
 }

@@ -59,12 +59,21 @@ w() { # $@: watch args. env: SELF_DIR, BLOCKED
   [ -n "$b" ] && [ -n "$s" ] && [ "$b" -lt "$s" ]
 }
 
-@test "on refuses when updates are blocked and writes nothing" {
+@test "on with the block on installs the helper and says nothing about the block" {
   BLOCKED=/Library/x.plist SELF_DIR=/opt/cl/bin run w on
-  [ "$status" -eq 1 ]
-  [[ "$output" == *"/Library/x.plist"* ]]
-  [ ! -e "$PLIST" ]
-  [ ! -s "$LC_CALLS" ]
+  [ "$status" -eq 0 ]
+  [ -f "$PLIST" ]
+  [[ "$output" != *"updater is on"* ]]
+  grep -qx "bootstrap gui/$UID_ $PLIST" "$LC_CALLS"
+}
+
+@test "on with the block off warns in plain English and still installs the helper" {
+  SELF_DIR=/opt/cl/bin run w on
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Claude's own updater is on, so Claude may close accounts by itself when an update arrives; claudes still works."* ]]
+  [[ "$output" == *"To stop that, install the block profile."* ]]
+  [ -f "$PLIST" ]
+  grep -qx "bootstrap gui/$UID_ $PLIST" "$LC_CALLS"
 }
 
 @test "on fails clearly when SELF is unset" {

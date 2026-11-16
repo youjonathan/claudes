@@ -4,11 +4,12 @@
 setup() {
   REPO="$(cd "$BATS_TEST_DIRNAME/.." && pwd)"
   W="$BATS_TEST_TMPDIR/world"
-  mkdir -p "$W/markers" "$W/busy" "$W/nostop" "$W/running.d"
+  mkdir -p "$W/Claude.app" "$W/confirm_busy" "$W/markers" "$W/busy" "$W/nostop" "$W/running.d"
   export CLAUDES_STATE_DIR="$W/state" CLAUDES_SUPPORT_DIR="$W/support" CLAUDES_APP_SRC="$W/Claude.app"
   export CLAUDES_LAUNCHAGENTS_DIR="$W/la" CLAUDES_APPS_DIR="$W/Apps"
-  export CLAUDES_POLL=1 CLAUDES_MAX_WAIT=3 CLAUDES_INSTALL_TIMEOUT=6 CLAUDES_MARKER_GRACE=300 CLAUDES_MARKER_MAX_AGE=43200
-  for f in common config instance procs update_detect update watch; do source "$REPO/lib/$f.sh"; done
+  export CLAUDES_CONFIRM_SECONDS=0 CLAUDES_CONFIRM_EVERY=1
+  export CLAUDES_POLL=1 CLAUDES_INSTALL_TIMEOUT=6 CLAUDES_MARKER_GRACE=300 CLAUDES_MARKER_MAX_AGE=43200
+  for f in common config instance procs update_detect release install update watch; do source "$REPO/lib/$f.sh"; done
 
   SUP="$CLAUDES_SUPPORT_DIR"
   A="$SUP/Claude"; C="$SUP/Claude-3p"; D="$SUP/Claude-Acct-D"; E="$SUP/Claude-E"
@@ -16,6 +17,7 @@ setup() {
   echo 100 > "$W/build"
   echo waiting > "$W/state_word"
   echo success > "$W/mode"
+  : > "$W/calls"; NEWEST=1.101
   printf '%s\t%s\n' "$A" "$W/Apps/Claude A.app" "$C" "$W/Apps/Claude C.app" "$D" "$W/Apps/Claude D.app" > "$W/accounts"
 
   # ---- fake world (redefines the real functions after sourcing) ----
@@ -32,7 +34,7 @@ setup() {
   shipit_log_size() { wc -c < "$W/log" | tr -d ' '; }
   marker_says_update_quit() { [ "$(awk '{print $1}' "$W/markers/$(basename "$1")" 2>/dev/null)" = update ]; }
   marker_age() { awk '{print $2}' "$W/markers/$(basename "$1")"; }
-  account_idle() {
+  account_idle_settled() {
     local f="$W/busy/$(basename "$1")" n
     [ -e "$f" ] || return 0
     n="$(cat "$f")"
@@ -41,6 +43,16 @@ setup() {
     echo "Claude Code used 14s of CPU in 20s"
     return 1
   }
+  account_idle() {   # the confirmation phase's check: busy while the file holds a count above 0
+    local f="$W/confirm_busy/$(basename "$1")" n
+    [ -e "$f" ] || return 0
+    n="$(cat "$f")"
+    [ "$n" -gt 0 ] || return 0
+    echo $((n - 1)) > "$f"
+    echo "its window is in front"
+    return 1
+  }
+  idle_rules_report() { echo "RULES-REPORT"; }
   # ShipIt: once every copy has been stopped and none runs, it installs (or fails) by itself
   _tick() {
     [ -e "$W/stopped" ] && [ ! -e "$W/installed" ] || return 0
@@ -78,7 +90,37 @@ setup() {
   claudes_notify() { echo "$*" >> "$W/notes"; }
   update_staged_age() { cat "$W/staged_age" 2>/dev/null || return 1; }
   shipit_waiting() { [ -e "$W/shipit_running" ]; }
-  user_idle_seconds() { if [ -e "$W/useridle" ]; then cat "$W/useridle"; else return 1; fi; }
+  # pieces 1 and 3 (release.sh, install.sh): the state files are real, the work is faked
+  release_check() { [ ! -e "$W/nocheck" ] || return 1; echo "$NEWEST"; }
+  release_is_newer() { [ -e "$W/newer" ]; }
+  release_ready_get() { [ -f "$CLAUDES_STATE_DIR/ready" ] && awk -F'\t' -v k="$1" '$1==k { print $2; f=1; exit } END { exit !f }' "$CLAUDES_STATE_DIR/ready"; }
+  release_ready_set() {
+    { grep -v "^$1	" "$CLAUDES_STATE_DIR/ready" || true; printf '%s\t%s\n' "$1" "$2"; } > "$CLAUDES_STATE_DIR/ready.tmp"
+    mv "$CLAUDES_STATE_DIR/ready.tmp" "$CLAUDES_STATE_DIR/ready"
+  }
+  release_ready_version() { release_ready_get version; }
+  release_ready_app() { local a; a="$(release_ready_get app)" && [ -d "$a" ] && echo "$a"; }
+  eval "_real_$(declare -f release_prepare)"
+  release_prepare() {
+    echo prepare >> "$W/calls"
+    if [ -e "$W/prepfail" ]; then echo "The download did not match its checksum."; return 1; fi
+    mkdir -p "$W/new/Claude.app" "$CLAUDES_STATE_DIR"
+    if [ ! -f "$CLAUDES_STATE_DIR/ready" ]; then
+      printf 'version\t%s\napp\t%s\nfirst_seen\t%s\n' "$NEWEST" "$W/new/Claude.app" "${FIRST_SEEN:-$(claudes_now)}" > "$CLAUDES_STATE_DIR/ready"
+    fi
+  }
+  release_discard() { echo discard >> "$W/calls"; rm -f "$CLAUDES_STATE_DIR/ready"; }
+  install_shipit_path() { [ ! -e "$W/moveonly" ]; }
+  install_backup_old() { echo "backup (open copies: $(ls "$W/running.d" | wc -l | tr -d ' '))" >> "$W/calls"; [ ! -e "$W/backupfail" ] || { echo "Could not keep a copy of the current Claude."; return 1; }; }
+  install_new() {
+    echo "install $1 (open copies: $(ls "$W/running.d" | wc -l | tr -d ' '))" >> "$W/calls"
+    [ ! -e "$W/installfail" ] || { echo "macOS blocked the move."; return 1; }
+    echo 101 > "$W/build"; echo "Installed the new Claude with Claude's own installer."
+  }
+  install_rollback() { echo rollback >> "$W/calls"; echo 100 > "$W/build"; }
+  install_finish() { echo finish >> "$W/calls"; }
+  # the release flow: no Claude-own installer waiting, a newer version out there
+  release_world() { echo none > "$W/state_word"; echo none > "$W/mode"; touch "$W/newer"; }
   run_up() { local n; for n in "$@"; do touch "$W/running.d/$n"; done; }
   set_marker() { echo "$2 $3" > "$W/markers/$1"; }
   set -euo pipefail   # the real script runs this way; catch unset variables and aborted pipelines
@@ -86,21 +128,29 @@ setup() {
 
 events() { cat "$W/events"; }
 
-@test "1a. blocked: explains, exits 1, signals nothing" {
+@test "1a. block on is the healthy state: nothing alarming, the run carries on" {
   touch "$W/blocked"; run_up Claude
+  echo none > "$W/state_word"
   run cmd_update
-  [ "$status" -eq 1 ]
-  [[ "$output" == *"switched off"* ]]
-  [[ "$output" == *"$W/blocked"* ]]
-  [ ! -s "$W/events" ]
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Claude is up to date (1.100)"* ]]
+  [[ "$output" != *"updater is on"* ]]
 }
 
-@test "1b. blocked with --dry-run exits 0" {
-  touch "$W/blocked"
-  run cmd_update --dry-run
+@test "1b. block off: one plain warning, then it carries on" {
+  echo none > "$W/state_word"
+  run cmd_update
   [ "$status" -eq 0 ]
-  [[ "$output" == *"switched off"* ]]
-  [ ! -s "$W/events" ]
+  [[ "$output" == *"Claude's own updater is on, so Claude may close accounts by itself when an update arrives; claudes still works."* ]]
+  [[ "$output" == *"To stop that, install the block profile."* ]]
+  [[ "$output" == *"Claude is up to date"* ]]
+}
+
+@test "1c. the warning is not repeated in the watcher's log" {
+  echo none > "$W/state_word"
+  run cmd_update --watch-run
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"updater is on"* ]]
 }
 
 @test "2a. real run inside a Claude copy refuses with exit 1" {
@@ -125,14 +175,15 @@ events() { cat "$W/events"; }
   [[ "$output" == *"usage: claudes update"* ]]
 }
 
-@test "3. no update: says so, runs the safety net, exits 0" {
+@test "3. up to date: says so, runs the safety net, exits 0, downloads nothing" {
   echo none > "$W/state_word"
   set_marker Claude update 400
   run cmd_update
   [ "$status" -eq 0 ]
-  [[ "$output" == *"No Claude update is waiting"* ]]
+  [[ "$output" == *"Claude is up to date (1.100)"* ]]
   [[ "$output" == *"Claude A"* ]]
   [ "$(events)" = "open $W/Apps/Claude A.app" ]
+  [ ! -s "$W/calls" ]
 }
 
 @test "4. dry-run with 3 open accounts (one busy) prints the plan and changes nothing" {
@@ -146,6 +197,7 @@ events() { cat "$W/events"; }
   [[ "$output" == *"Quit these together: Claude A, Claude C, Claude D"* ]]
   [[ "$output" == *"Claude C, from its own launcher"* ]]
   [[ "$output" == *"Claude D, from its own launcher"* ]]
+  [[ "$output" == *"RULES-REPORT"* ]]
   [ ! -s "$W/events" ]
   [ ! -e "$W/state" ]
 }
@@ -284,7 +336,7 @@ open $W/Apps/Claude D.app" ]
   echo "$dead" > "$CLAUDES_STATE_DIR/update.lock/pid"
   run cmd_update
   [ "$status" -eq 0 ]
-  [[ "$output" == *"No Claude update is waiting"* ]]
+  [[ "$output" == *"Claude is up to date"* ]]
   [ ! -e "$CLAUDES_STATE_DIR/update.lock" ]
 }
 
@@ -298,30 +350,43 @@ open $W/Apps/Claude D.app" ]
   [ "$(events | grep -c '^stop ')" -ge 2 ]
 }
 
-@test "13b. plain run gives up after CLAUDES_MAX_WAIT without quitting anything" {
+@test "13b. a plain run keeps waiting with no time limit, and quits only once everyone is idle" {
   run_up Claude Claude-3p
-  echo 99 > "$W/busy/Claude-3p"
+  echo 30 > "$W/busy/Claude-3p"
+  CLOCK_STEP=1000      # 30 polls = 30000 s of fake time, far past the old 4 hour limit
   run cmd_update
-  [ "$status" -eq 1 ]
-  [[ "$output" == *"Gave up waiting"* ]]
-  [ ! -s "$W/events" ]
-  [ ! -e "$CLAUDES_STATE_DIR/reopen-pending" ]
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"Gave up"* ]]
+  [ "$(wc -l < "$W/sleeps" | tr -d ' ')" -ge 30 ]
+  [ "$(events | grep -c '^stop ')" -ge 2 ]
+  # who is busy is printed once while it stays the same
+  [ "$(printf '%s\n' "$output" | grep -c 'Claude C is busy')" = 1 ]
 }
 
-@test "doctor_update_report prints the four kinds of line" {
+@test "doctor_update_report: installed, newest, download waiting, block, watcher, launcher note" {
   run_up Claude-E
+  touch "$W/blocked"
   echo "no-installer" > "$W/state_word"
+  echo 1.101 > "$W/newest"; NEWEST=1.101
   run doctor_update_report
   [ "$status" -eq 0 ]
-  [[ "$output" == *"auto-updates: on"* ]]
-  [[ "$output" == *"update: downloaded but installer not waiting"* ]]
+  [[ "$output" == *"Claude installed: 1.100"* ]]
+  [[ "$output" == *"newest released Claude: 1.101"* ]]
+  [[ "$output" == *"verified download waiting: no"* ]]
+  [[ "$output" == *"auto-updates: block on (expected), set by $W/blocked"* ]]
   [[ "$output" == *"watcher: not installed"* ]]
   [[ "$output" == *"note: $E is open without a launcher; after an update it reopens with the plain Claude icon"* ]]
-  mkdir -p "$CLAUDES_LAUNCHAGENTS_DIR"; touch "$CLAUDES_LAUNCHAGENTS_DIR/$CLAUDES_WATCH_LABEL.plist"
-  touch "$W/blocked"
+  rm "$W/blocked"
+  mkdir -p "$CLAUDES_LAUNCHAGENTS_DIR" "$CLAUDES_STATE_DIR"
+  touch "$CLAUDES_LAUNCHAGENTS_DIR/$CLAUDES_WATCH_LABEL.plist"
+  mkdir -p "$W/new/Claude.app"
+  printf 'version\t1.101\napp\t%s\nfirst_seen\t1000000\n' "$W/new/Claude.app" > "$CLAUDES_STATE_DIR/ready"
+  touch "$W/nocheck"
   run doctor_update_report
-  [[ "$output" == *"auto-updates: BLOCKED by $W/blocked (claudes update needs Claude's own updater on)"* ]]
+  [[ "$output" == *"auto-updates: block OFF — Claude's own updater may close accounts by itself"* ]]
   [[ "$output" == *"watcher: installed"* ]]
+  [[ "$output" == *"newest released Claude: unknown"* ]]
+  [[ "$output" == *"verified download waiting: yes (version 1.101, since "* ]]
 }
 
 # ---- end to end: the real bin/claudes as a subprocess (set -euo pipefail), fake ps/launchctl on PATH ----
@@ -359,14 +424,35 @@ P
   printf '#!/bin/sh\necho "\tstate = running"\n' > "$T/bin/launchctl"
   chmod +x "$T/bin/ps" "$T/bin/launchctl"
   mkdir -p "$T/support/Claude-3p/claude-code-sessions"; touch "$T/support/Claude-3p/claude-code-sessions/work.json"
+  # a copy of the repo whose release/install libs are test doubles (no network, no installing), and whose
+  # idle functions get a stand-in when update_detect.sh does not define them yet
+  mkdir -p "$T/repo"; cp -R "$BATS_TEST_DIRNAME/../bin" "$BATS_TEST_DIRNAME/../lib" "$T/repo/"
+  cat > "$T/repo/lib/release.sh" <<'P'
+release_check() { echo "${E2E_NEWEST:-2.0.0}"; }
+release_is_newer() { [ "${E2E_NEWEST:-2.0.0}" != 1.0.0 ]; }
+release_ready_version() { return 1; }
+release_ready_app() { return 1; }
+release_ready_get() { return 1; }
+release_ready_set() { return 0; }
+release_prepare() { return 0; }
+release_discard() { return 0; }
+P
+  cat > "$T/repo/lib/install.sh" <<'P'
+install_shipit_path() { return 0; }
+install_new() { return 1; }
+P
+  cat >> "$T/repo/lib/update_detect.sh" <<'P'
+declare -F account_idle_settled >/dev/null || account_idle_settled() { account_idle "$@"; }
+declare -F idle_rules_report >/dev/null || idle_rules_report() { echo "rules report (stand-in)"; }
+P
 }
 
 e2e_run() { # args to claudes update
   run env -i HOME="$T/home" USER=tester PATH="$T/bin:/usr/bin:/bin:/usr/sbin:/sbin" E2E_PS="$T/ps.txt" \
     CLAUDES_APP_SRC="$T/app/Claude.app" CLAUDES_APPS_DIR="$T/apps" CLAUDES_SUPPORT_DIR="$T/support" \
     CLAUDES_SHIPIT_DIR="$T/shipit" CLAUDES_MANAGED_PREFS_DIR="$T/managed" CLAUDES_CONFIG="$T/config" \
-    CLAUDES_STATE_DIR="$T/state" CLAUDES_CPU_SAMPLE=1 \
-    /bin/bash "$BATS_TEST_DIRNAME/../bin/claudes" update "$@"
+    CLAUDES_STATE_DIR="$T/state" CLAUDES_CPU_SAMPLE=1 E2E_NEWEST="${E2E_NEWEST:-2.0.0}" \
+    /bin/bash "$T/repo/bin/claudes" update "$@"
 }
 
 @test "e2e: bin/claudes update --dry-run with a waiting update lists the open accounts by launcher name" {
@@ -377,20 +463,36 @@ e2e_run() { # args to claudes update
   [[ "$output" != *"unbound variable"* ]]
   [[ "$output" == *"A Claude update is waiting to install (build 100 -> 200)"* ]]
   [[ "$output" == *"Quit these together: Claude A, Claude C, Claude D"* ]]
-  [[ "$output" == *"Claude C is busy: session files changed"* ]]
-  [[ "$output" == *"Claude A: idle"* ]]
+  [[ "$output" == *"Claude C is busy"* ]]
+  [[ "$output" == *"Claude A"* ]]
   [ ! -e "$T/state" ]
 }
 
-@test "e2e: dry-run with no update waiting still shows open accounts and the safety net" {
+@test "e2e: dry-run with a newer Claude out there shows the new plan and the rules report" {
   e2e_world
   rm "$T/shipit/ShipItState.plist"
   e2e_run --dry-run
   echo "$output"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"No Claude update is waiting."* ]]
+  [[ "$output" != *"unbound variable"* ]]
+  [[ "$output" == *"Installed Claude: 1.0.0"* ]]
+  [[ "$output" == *"Newest Claude: 2.0.0"* ]]
+  [[ "$output" == *"Verified download waiting: no"* ]]
   [[ "$output" == *"Open accounts:"* ]]
-  [[ "$output" == *"Claude A: idle"* ]]
+  [[ "$output" == *"Claude C is busy"* ]]
+  [[ "$output" == *"Quit these together: Claude A, Claude C, Claude D"* ]]
+  [[ "$output" == *"rules report"* ]] || [[ "$output" == *"window"* ]]
+  [ ! -e "$T/state" ]
+}
+
+@test "e2e: dry-run when up to date still shows open accounts and the safety net" {
+  e2e_world
+  rm "$T/shipit/ShipItState.plist"
+  E2E_NEWEST=1.0.0 e2e_run --dry-run
+  echo "$output"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Claude is up to date (1.0.0)"* ]]
+  [[ "$output" == *"Open accounts:"* ]]
   [[ "$output" == *"Claude C is busy"* ]]
   [[ "$output" == *"Accounts that quit for an update and did not come back:"* ]]
   [ ! -e "$T/state" ]
@@ -566,43 +668,15 @@ open $W/Apps/Claude C.app" ]
   [ "$(events)" = "open -n -a $CLAUDES_APP_SRC" ]
 }
 
-@test "fix 9a. watch-run waits while someone used the Mac recently" {
-  run_up Claude Claude-3p
-  echo 120 > "$W/useridle"
-  run cmd_update --watch-run
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"someone used the Mac 2 min ago"* ]]
-  [ ! -s "$W/events" ]
-}
-
-@test "fix 9b. watch-run waits when the idle time cannot be read" {
+@test "fix 9. watch-run proceeds when every account is idle, whatever the Mac is doing" {
   run_up Claude
-  run cmd_update --watch-run
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"can't tell if someone is using the Mac"* ]]
-  [ ! -s "$W/events" ]
-}
-
-@test "fix 9c. watch-run proceeds when the Mac has been idle long enough; a manual run ignores user idle time" {
-  run_up Claude
-  echo 700 > "$W/useridle"
   run cmd_update --watch-run
   [ "$status" -eq 0 ]
   [[ "$output" == *"Claude updated"* ]]
   rm -rf "$W/stopped" "$W/installed" "$W/running.d/"*; run_up Claude
-  echo 5 > "$W/useridle"; echo 100 > "$W/build"
+  echo 100 > "$W/build"
   run cmd_update
   [[ "$output" == *"Claude updated"* ]]
-}
-
-@test "fix 11. the manual-run wait is measured with the clock, not by adding up poll intervals" {
-  run_up Claude Claude-3p
-  echo 99 > "$W/busy/Claude-3p"
-  CLAUDES_MAX_WAIT=30; CLAUDES_POLL=1; CLOCK_STEP=20
-  run cmd_update
-  [ "$status" -eq 1 ]
-  [[ "$output" == *"Gave up waiting"* ]]
-  [ "$(wc -l < "$W/sleeps" | tr -d ' ')" = 2 ]
 }
 
 @test "fix 12. a watcher log over 1 MB is cut to its last 2000 lines at the start of a watch-run" {
@@ -620,7 +694,7 @@ open $W/Apps/Claude C.app" ]
 clean_run() {   # SHELLCODE -> status of a clean "bash -euo pipefail" that has all current functions
   export W SUP A C D E CLOCK_STEP
   bash -c "$(declare -f)
-$(declare -p $(compgen -v | grep -E '^(CLAUDES_|UPDATE_|_KA_|_ka_|_PLIST|_SHIPIT)') 2>/dev/null)
+$(declare -p $(compgen -v | grep -E '^(CLAUDES_|UPDATE_|_KA_|_ka_|_PLIST|_SHIPIT|NEWEST)') 2>/dev/null)
 trap - ERR DEBUG; set -euo pipefail
 $1"
 }
@@ -634,6 +708,7 @@ hup_sleep() {   # fake sleep: the first time after the accounts are stopped, sen
 
 @test "A1. closing the Terminal (HUP) while the output pipe is broken: the run completes and reopens" {
   export CLAUDES_LOG_DIR="$W/logs"
+  touch "$W/blocked"   # the healthy state: no warning lines, so the pipe breaks after the same two lines as always
   echo none > "$W/mode"
   run_up Claude Claude-3p
   claudes_sleep() { hup_sleep "$@"; }
@@ -735,7 +810,6 @@ open $W/Apps/Claude E.app" ]
   printf '%s\t%s\n' "$A" "$W/Apps/Claude A.app" "$E" "$W/Apps/Claude E.app" > "$W/accounts"
   marker_says_update_quit() { [ "$(basename "$1")" != Claude-E ] || [ -e "$W/installed" ]; }   # E's marker only appears after the install
   update_state() { if [ -e "$W/installed" ]; then echo none; else echo waiting; fi; }
-  echo 700 > "$W/useridle"
   run cmd_update --watch-run
   [ "$(events | grep -c "Claude E.app")" = 0 ]
 }
@@ -791,4 +865,507 @@ open $W/Apps/Claude C.app" ]
   [ "$status" -eq 0 ]
   [ "$(events | grep '^open ')" = "open $W/Apps/Claude A.app" ]
   [ ! -e "$CLAUDES_STATE_DIR/reopen-pending" ]
+}
+
+# ---- the claudes download flow (release.sh and install.sh are faked in setup) ----
+
+@test "N1. up to date: nothing is downloaded, a leftover download is dropped" {
+  echo none > "$W/state_word"
+  mkdir -p "$CLAUDES_STATE_DIR"; printf 'version\t1.050\napp\t%s\n' "$W/new" > "$CLAUDES_STATE_DIR/ready"
+  run cmd_update
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Claude is up to date (1.100)"* ]]
+  [ "$(cat "$W/calls")" = discard ]
+}
+
+@test "N2. a newer Claude: it is downloaded and checked, then every account idle -> quit, install, reopen, finish" {
+  release_world; run_up Claude Claude-3p Claude-Acct-D
+  run cmd_update
+  echo "$output"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Claude 1.101 is available (you have 1.100)"* ]]
+  [[ "$output" == *"Claude updated: 1.100 (build 100) -> 1.101 (build 101)"* ]]
+  [ "$(cat "$W/calls")" = "prepare
+backup (open copies: 3)
+install $W/new/Claude.app (open copies: 0)
+finish
+discard" ]
+  ev="$(events)"
+  first_open="$(printf '%s\n' "$ev" | grep -n '^open ' | head -1 | cut -d: -f1)"
+  last_stop="$(printf '%s\n' "$ev" | grep -n '^stop ' | tail -1 | cut -d: -f1)"
+  [ "$(printf '%s\n' "$ev" | grep -c '^stop ')" = 3 ]
+  [ "$last_stop" -lt "$first_open" ]
+  [ "$(printf '%s\n' "$ev" | grep -c '^open ')" = 3 ]
+  [ ! -e "$CLAUDES_STATE_DIR/reopen-pending" ]
+  [ ! -e "$CLAUDES_STATE_DIR/update.lock" ]
+  # the first launch is checked after the wait
+  grep -qx 20 "$W/sleeps"
+}
+
+@test "N3. the download fails its checks: nothing is quit, exit 1" {
+  release_world; run_up Claude Claude-3p
+  touch "$W/prepfail"
+  run cmd_update
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"did not match its checksum"* ]]
+  [[ "$output" == *"nothing was quit"* ]]
+  [ ! -s "$W/events" ]
+  [ "$(cat "$W/calls")" = prepare ]
+  [ ! -e "$CLAUDES_STATE_DIR/reopen-pending" ]
+}
+
+@test "N4. the feed cannot be read: a manual run exits 1, the watcher exits 0, nothing is touched" {
+  release_world; run_up Claude; touch "$W/nocheck"
+  run cmd_update
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Could not find out the newest Claude version"* ]]
+  run cmd_update --watch-run
+  [ "$status" -eq 0 ]
+  [ ! -s "$W/events" ]
+  [ ! -s "$W/calls" ]
+}
+
+@test "N5. the 7-day notice is sent once and never again for that version" {
+  release_world; run_up Claude Claude-3p
+  echo 99 > "$W/busy/Claude-3p"
+  FIRST_SEEN=$(( $(cat "$W/clock") - 8 * 86400 ))
+  run cmd_update --watch-run
+  [ "$status" -eq 0 ]
+  [ "$(grep -c "waiting 7 days because your accounts are never all idle at once. Run claudes update in Terminal to see what is busy." "$W/notes")" = 1 ]
+  [ -n "$(release_ready_get notified)" ]
+  run cmd_update --watch-run
+  run cmd_update --watch-run
+  [ "$(wc -l < "$W/notes" | tr -d ' ')" = 1 ]
+  [ ! -s "$W/events" ]
+}
+
+@test "N6. a download that is only 3 days old sends no notice" {
+  release_world; run_up Claude Claude-3p
+  echo 99 > "$W/busy/Claude-3p"
+  FIRST_SEEN=$(( $(cat "$W/clock") - 3 * 86400 ))
+  run cmd_update --watch-run
+  [ ! -s "$W/notes" ]
+  [ -z "$(release_ready_get notified || true)" ]
+}
+
+@test "N7. install fails: accounts reopened on the old version, exit 1, the download is kept" {
+  release_world; run_up Claude Claude-3p
+  touch "$W/installfail"
+  run cmd_update
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"macOS blocked the move."* ]]
+  [[ "$output" == *"Reopening your accounts on the old version"* ]]
+  [ "$(events | grep '^open ')" = "open $W/Apps/Claude A.app
+open $W/Apps/Claude C.app" ]
+  [ "$(cat "$W/build")" = 100 ]
+  ! grep -qx finish "$W/calls"
+  ! grep -qx rollback "$W/calls"
+  [ -n "$(release_ready_version)" ]
+  [ ! -e "$CLAUDES_STATE_DIR/reopen-pending" ]
+}
+
+@test "N8. no account stays open on the new Claude: the old one is put back and everyone reopened" {
+  release_world; run_up Claude Claude-3p
+  claudes_sleep() {   # the new version crashes during the 20 s wait
+    echo "$1" >> "$W/sleeps"; echo $(( $(cat "$W/clock") + 1 )) > "$W/clock"
+    if [ "$1" = 20 ] && [ "$(cat "$W/build")" = 101 ]; then rm -f "$W/running.d/"*; fi
+  }
+  run cmd_update
+  echo "$output"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Putting the old version back"* ]]
+  [[ "$output" == *"reopened on the old version"* ]]
+  grep -qx rollback "$W/calls"
+  ! grep -qx finish "$W/calls"
+  [ "$(cat "$W/build")" = 100 ]
+  [ "$(events | grep -c '^open ')" = 4 ]     # opened on the new version, then again on the old
+  [ -e "$W/running.d/Claude" ] && [ -e "$W/running.d/Claude-3p" ]
+  [ ! -e "$CLAUDES_STATE_DIR/reopen-pending" ]
+}
+
+@test "N9. if only some accounts crash on the first launch the update stands" {
+  release_world; run_up Claude Claude-3p
+  claudes_sleep() {
+    echo "$1" >> "$W/sleeps"; echo $(( $(cat "$W/clock") + 1 )) > "$W/clock"
+    if [ "$1" = 20 ]; then rm -f "$W/running.d/Claude-3p"; fi
+  }
+  run cmd_update
+  [ "$status" -eq 0 ]
+  ! grep -qx rollback "$W/calls"
+  grep -qx finish "$W/calls"
+}
+
+@test "N10. watch-run, only the move path is left: nothing is quit, one notice, no retry for 24 hours" {
+  release_world; run_up Claude Claude-3p
+  touch "$W/moveonly"
+  run cmd_update --watch-run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"needs Terminal"* ]]
+  [ ! -s "$W/events" ]
+  [ "$(cat "$W/notes")" = "Claude update ready — run claudes update in Terminal to finish" ]
+  [ -n "$(release_ready_get needs_terminal)" ]
+  run cmd_update --watch-run
+  run cmd_update --watch-run
+  [ "$(wc -l < "$W/notes" | tr -d ' ')" = 1 ]
+  [ ! -s "$W/events" ]
+  echo $(( $(cat "$W/clock") + 25 * 3600 )) > "$W/clock"
+  run cmd_update --watch-run
+  [ "$(wc -l < "$W/notes" | tr -d ' ')" = 2 ]
+  [ ! -s "$W/events" ]
+  # a manual run in Terminal ignores the back-off and finishes the update
+  run cmd_update
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Claude updated"* ]]
+}
+
+@test "N11. watch-run, the install fails: accounts reopened, notice, 24 hour back-off" {
+  release_world; run_up Claude Claude-3p
+  touch "$W/installfail"
+  run cmd_update --watch-run
+  [ "$status" -eq 1 ]
+  [ "$(events | grep -c '^open ')" = 2 ]
+  [[ "$(cat "$W/notes")" == *"run claudes update in Terminal to finish"* ]]
+  [ -n "$(release_ready_get needs_terminal)" ]
+  run cmd_update --watch-run
+  [ "$(events | grep -c '^stop ')" = 2 ]    # still only the first attempt
+}
+
+@test "N12. watch-run with a busy account: one check, exit 0, nothing quit" {
+  release_world; run_up Claude Claude-3p
+  echo 5 > "$W/busy/Claude-3p"
+  run cmd_update --watch-run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Claude C is busy"* ]]
+  [ ! -s "$W/events" ] && [ ! -s "$W/sleeps" ]
+}
+
+@test "N13. a plain run stops waiting if the downloaded update disappears" {
+  release_world; run_up Claude Claude-3p
+  echo 99 > "$W/busy/Claude-3p"
+  claudes_sleep() { echo "$1" >> "$W/sleeps"; rm -rf "$W/new"; }
+  run cmd_update
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"The downloaded update is gone"* ]]
+  [ ! -s "$W/events" ]
+}
+
+@test "N14. Claude's own waiting installer still takes its own branch and does not download" {
+  release_check() { echo "release_check called" >> "$W/calls"; echo 1.101; }
+  run_up Claude
+  run cmd_update
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"A Claude update is waiting to install"* ]]
+  [[ "$output" == *"Claude updated"* ]]
+  [ ! -s "$W/calls" ]
+}
+
+@test "N15. every idle check uses the countdown version of the rule, none uses Mac idle time" {
+  release_world; run_up Claude
+  account_idle_settled() { echo "$1" >> "$W/settled"; return 0; }
+  run cmd_update
+  [ "$status" -eq 0 ]
+  grep -qx "$A" "$W/settled"
+  ! grep -q "user_idle_seconds" "$REPO"/lib/update.sh
+  ! grep -q "CLAUDES_MAX_WAIT" "$REPO"/lib/*.sh "$REPO"/bin/claudes
+}
+
+@test "N16. dry run, newer Claude: writes nothing at all (state folder compared before and after), shows each account and the rules" {
+  release_world; run_up Claude Claude-3p
+  echo 5 > "$W/busy/Claude-3p"
+  mkdir -p "$CLAUDES_STATE_DIR"; echo keep > "$CLAUDES_STATE_DIR/release-check"
+  release_check() {   # a real check would refresh the cache; in a dry run that must land in a scratch folder
+    mkdir -p "$CLAUDES_STATE_DIR"; echo refreshed > "$CLAUDES_STATE_DIR/release-check"; echo "$NEWEST"
+  }
+  account_idle_settled() { echo "readonly=$CLAUDES_IDLE_READONLY" >> "$W/ro"; echo "quiet for 3 of 10 minutes"; return 1; }
+  before="$(cd "$CLAUDES_STATE_DIR" && find . -type f | sort | xargs cat | cksum; find "$CLAUDES_STATE_DIR" | sort)"
+  run cmd_update --dry-run
+  echo "$output"
+  [ "$status" -eq 0 ]
+  after="$(cd "$CLAUDES_STATE_DIR" && find . -type f | sort | xargs cat | cksum; find "$CLAUDES_STATE_DIR" | sort)"
+  [ "$before" = "$after" ]
+  [ "$(cat "$CLAUDES_STATE_DIR/release-check")" = keep ]
+  [ ! -e "$CLAUDES_STATE_DIR/update.lock" ]
+  grep -qx "readonly=1" "$W/ro"
+  [ ! -s "$W/events" ] && [ ! -s "$W/calls" ]
+  [[ "$output" == *"Installed Claude: 1.100"* ]]
+  [[ "$output" == *"Newest Claude: 1.101"* ]]
+  [[ "$output" == *"Verified download waiting: no"* ]]
+  [[ "$output" == *"It would download Claude 1.101"* ]]
+  [[ "$output" == *"Claude's own updater: ON"* ]]
+  [[ "$output" == *"Claude A is busy: quiet for 3 of 10 minutes"* ]]
+  [[ "$output" == *"Claude C is busy: quiet for 3 of 10 minutes"* ]]
+  [[ "$output" == *"RULES-REPORT"* ]]
+  [[ "$output" == *"Check that the accounts are still open 20 seconds later"* ]]
+}
+
+@test "N17. dry run with a verified download waiting and the block on says so" {
+  release_world; run_up Claude
+  touch "$W/blocked"
+  mkdir -p "$W/new/Claude.app" "$CLAUDES_STATE_DIR"
+  printf 'version\t1.101\napp\t%s\nfirst_seen\t5\n' "$W/new/Claude.app" > "$CLAUDES_STATE_DIR/ready"
+  run cmd_update --dry-run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Verified download waiting: yes (version 1.101)"* ]]
+  [[ "$output" == *"blocked by $W/blocked (expected)"* ]]
+  [[ "$output" != *"It would download"* ]]
+}
+
+@test "N18. dry run when up to date lists accounts, rules and changes nothing" {
+  echo none > "$W/state_word"; run_up Claude
+  run cmd_update --dry-run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Claude is up to date (1.100)"* ]]
+  [[ "$output" == *"Claude A: idle"* ]]
+  [[ "$output" == *"RULES-REPORT"* ]]
+  [ ! -e "$W/state" ]
+}
+
+# ---- review fixes: rollback memory, second check, interrupts, repair, backup order, confirmation, lock ----
+
+crash_on_first_launch() {   # the new version dies during the first-launch wait
+  claudes_sleep() {
+    echo "$1" >> "$W/sleeps"; echo $(( $(cat "$W/clock") + 1 )) > "$W/clock"
+    if [ "$1" = 20 ] && [ "$(cat "$W/build")" = 101 ]; then rm -f "$W/running.d/"*; fi
+  }
+}
+
+@test "R1. after a rollback the version is recorded as failed and the next cycle quits nobody" {
+  release_world; run_up Claude Claude-3p
+  crash_on_first_launch
+  run cmd_update
+  [ "$status" -eq 1 ]
+  grep -qx rollback "$W/calls"
+  [ "$(awk -F'\t' '$1=="version"{print $2}' "$CLAUDES_STATE_DIR/release-failed")" = 1.101 ]
+  grep -q '^reason' "$CLAUDES_STATE_DIR/release-failed"
+  grep -q '^at' "$CLAUDES_STATE_DIR/release-failed"
+  [ ! -e "$CLAUDES_STATE_DIR/ready" ]
+  # second cycle: the real release_prepare sees the record and pauses
+  release_prepare() { _real_release_prepare; }
+  : > "$W/events"; : > "$W/calls"
+  run cmd_update
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"failed its checks"* ]]
+  [[ "$output" == *"nothing was quit"* ]]
+  ! grep -q '^stop ' "$W/events"
+  ! grep -q '^install' "$W/calls"
+  ! grep -q '^backup' "$W/calls"
+}
+
+@test "R1b. a failed rollback records the version too" {
+  release_world; run_up Claude
+  crash_on_first_launch
+  install_rollback() { echo rollback >> "$W/calls"; return 1; }
+  run cmd_update
+  [ "$status" -eq 1 ]
+  [ "$(awk -F'\t' '$1=="version"{print $2}' "$CLAUDES_STATE_DIR/release-failed")" = 1.101 ]
+}
+
+@test "R2. the old app is backed up before anyone is quit" {
+  release_world; run_up Claude Claude-3p
+  run cmd_update
+  [ "$status" -eq 0 ]
+  [ "$(sed -n 2p "$W/calls")" = "backup (open copies: 2)" ]
+}
+
+@test "R2b. a failed backup quits nothing, installs nothing and says so" {
+  release_world; run_up Claude Claude-3p
+  touch "$W/backupfail"
+  run cmd_update
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"The old Claude could not be saved, so nothing was quit."* ]]
+  [ ! -s "$W/events" ]
+  ! grep -q '^install' "$W/calls"
+  [ -e "$W/running.d/Claude" ] && [ -e "$W/running.d/Claude-3p" ]
+  [ -n "$(release_ready_version)" ]
+}
+
+@test "R3. a failed install that left Claude.app missing is rolled back before reopening" {
+  release_world; run_up Claude Claude-3p
+  install_new() { echo "macOS blocked the move."; rm -rf "$CLAUDES_APP_SRC"; return 1; }
+  install_rollback() { echo rollback >> "$W/calls"; mkdir -p "$CLAUDES_APP_SRC"; echo 100 > "$W/build"; }
+  run cmd_update
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Claude is missing from Applications. Putting the old version back."* ]]
+  grep -qx rollback "$W/calls"
+  [ "$(events | grep -c '^open ')" = 2 ]
+  [ -d "$CLAUDES_APP_SRC" ]
+}
+
+@test "R3b. a failed install that left an unexpected version is rolled back" {
+  release_world; run_up Claude
+  install_new() { echo 777 > "$W/build"; return 1; }
+  run cmd_update
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"unexpected state (version 777)"* ]]
+  grep -qx rollback "$W/calls"
+}
+
+@test "R3c. a failed install that left the old version in place needs no rollback" {
+  release_world; run_up Claude
+  touch "$W/installfail"
+  run cmd_update
+  [ "$status" -eq 1 ]
+  ! grep -qx rollback "$W/calls"
+}
+
+@test "R3d. when the rollback also fails the message says where the backup is" {
+  release_world; run_up Claude
+  install_new() { rm -rf "$CLAUDES_APP_SRC"; return 1; }
+  install_rollback() { echo "The old Claude could not be moved back."; return 1; }
+  run cmd_update
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"$CLAUDES_STATE_DIR/previous/Claude.app"* ]]
+  [[ "$output" == *"Reopening your accounts"* ]]
+}
+
+@test "R3e. under the watcher, a download that failed its last-moment check (status 3) sends no false Terminal notice" {
+  release_world; run_up Claude
+  install_new() { rm -f "$CLAUDES_STATE_DIR/ready"; return 3; }   # what _rel_fail leaves behind
+  run cmd_update --watch-run
+  [ "$status" -eq 1 ]
+  [[ "$output" != *"needs Terminal"* ]]
+  [ ! -e "$W/notes" ]
+  [ ! -e "$CLAUDES_STATE_DIR/ready" ]
+}
+
+@test "R3f. under the watcher, status 1 with the download still good asks for Terminal once" {
+  release_world; run_up Claude
+  touch "$W/installfail"
+  run cmd_update --watch-run
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"needs Terminal"* ]]
+  grep -q "run claudes update in Terminal" "$W/notes"
+  [ -n "$(release_ready_get needs_terminal)" ]
+}
+
+@test "R4. Ctrl-C before ShipIt starts copying removes the ShipIt job and puts a missing app back before reopening" {
+  release_world; run_up Claude Claude-3p
+  launchctl() { echo "launchctl $*" >> "$W/launchctl.log"; return 0; }
+  install_new() {
+    INSTALL_SHIPIT_SUBMITTED=1; rm -rf "$CLAUDES_APP_SRC"
+    bash -c 'echo $PPID' > "$W/me"; kill -TERM "$(cat "$W/me")"
+  }
+  install_rollback() { echo rollback >> "$W/calls"; mkdir -p "$CLAUDES_APP_SRC"; }
+  run cmd_update
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Interrupted"* ]]
+  grep -qx 'launchctl remove com.anthropic.claudefordesktop.ShipIt' "$W/launchctl.log"
+  grep -qx rollback "$W/calls"
+  [ "$(events | grep -c '^open ')" = 2 ]
+  [ ! -e "$CLAUDES_STATE_DIR/update.lock" ]
+}
+
+@test "R4b. Ctrl-C with nothing submitted and the app in place removes no job and rolls nothing back" {
+  release_world; run_up Claude
+  launchctl() { echo "launchctl $*" >> "$W/launchctl.log"; return 0; }
+  install_new() { bash -c 'echo $PPID' > "$W/me"; kill -TERM "$(cat "$W/me")"; }
+  run cmd_update
+  [ "$status" -eq 1 ]
+  [ ! -e "$W/launchctl.log" ]
+  ! grep -qx rollback "$W/calls"
+  [ "$(events | grep -c '^open ')" = 1 ]
+}
+
+@test "R5. the idle confirmation: a busy check aborts the attempt, nothing is quit until a whole quiet round" {
+  release_world; run_up Claude Claude-3p
+  export CLAUDES_CONFIRM_SECONDS=30 CLAUDES_CONFIRM_EVERY=10
+  echo 1 > "$W/confirm_busy/Claude-3p"
+  run cmd_update
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Claude C is busy: its window is in front"* ]]
+  [[ "$output" == *"Waiting until every account is idle"* ]]
+  [[ "$output" == *"Claude updated"* ]]
+  [ "$(grep -cx 10 "$W/sleeps")" = 4 ]     # 1 round before the abort, 3 on the second attempt
+  [ "$(events | grep -c '^stop ')" = 2 ]
+}
+
+@test "R5-1. a busy confirmation restarts that account's idle clock: the second attempt needs 10 full quiet minutes" {
+  release_world; run_up Claude
+  eval "$(sed -n '/^account_idle_settled()/,/^}/p' "$REPO/lib/update_detect.sh")"   # the real countdown, over the fake account_idle
+  export CLAUDES_CONFIRM_SECONDS=10 CLAUDES_CONFIRM_EVERY=10 CLAUDES_IDLE_MINUTES=10 CLOCK_STEP=60
+  mkdir -p "$CLAUDES_STATE_DIR"
+  printf '%s\t100\t%s\n' "$A" $(( $(claudes_now) - 700 )) > "$CLAUDES_STATE_DIR/idle-since"   # already quiet for 11 minutes
+  echo 1 > "$W/confirm_busy/Claude"
+  run cmd_update
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Claude A is busy: its window is in front"* ]] || false
+  [[ "$output" == *"quiet for 0 of 10 minutes"* ]] || false     # the clock started over, it did not pass at once
+  [[ "$output" == *"Claude updated"* ]] || false
+  [ "$(grep -cx 1 "$W/sleeps")" -ge 9 ]                # about 10 minutes of waiting at 60 s per poll
+}
+
+@test "R5-2. the confirmation checks every account at the same time" {
+  run_up Claude Claude-3p Claude-Acct-D
+  UPDATE_ACCOUNTS="$(update_open_accounts)"
+  export CLAUDES_CONFIRM_SECONDS=10 CLAUDES_CONFIRM_EVERY=10
+  account_idle() { echo "start" >> "$W/par"; sleep 0.5; echo "end" >> "$W/par"; return 0; }
+  run _update_confirm_idle
+  [ "$status" -eq 0 ]
+  [ "$(head -n 3 "$W/par" | grep -c start)" = 3 ]      # all three began before any finished
+}
+
+@test "R5-3. the confirmation is bounded by the clock, not by the number of rounds" {
+  run_up Claude
+  UPDATE_ACCOUNTS="$(update_open_accounts)"
+  export CLAUDES_CONFIRM_SECONDS=120 CLAUDES_CONFIRM_EVERY=15
+  account_idle() { echo $(( $(cat "$W/clock") + 20 )) > "$W/clock"; return 0; }   # each check takes 20 s, like the CPU sample
+  run _update_confirm_idle
+  [ "$status" -eq 0 ]
+  [ "$(grep -cx 15 "$W/sleeps")" = 4 ]                 # 35 s per round: 120 s is over after 4 rounds, not 8
+}
+
+@test "R5b. under the watcher a busy confirmation quits nothing and exits 0" {
+  release_world; run_up Claude Claude-3p
+  export CLAUDES_CONFIRM_SECONDS=30 CLAUDES_CONFIRM_EVERY=10
+  echo 2 > "$W/confirm_busy/Claude"
+  run cmd_update --watch-run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Claude A is busy"* ]]
+  [[ "$output" == *"Not updating now"* ]]
+  ! grep -q '^stop ' "$W/events"
+  ! grep -q '^install' "$W/calls"
+}
+
+@test "R5c. every account quiet through the whole confirmation: it goes ahead after the full wait" {
+  release_world; run_up Claude
+  export CLAUDES_CONFIRM_SECONDS=120 CLAUDES_CONFIRM_EVERY=15
+  run cmd_update
+  [ "$status" -eq 0 ]
+  [ "$(grep -cx 15 "$W/sleeps")" = 8 ]
+  [[ "$output" == *"Claude updated"* ]]
+}
+
+@test "R5d. a dry run skips the confirmation wait but says it would do it" {
+  release_world; run_up Claude
+  export CLAUDES_CONFIRM_SECONDS=120 CLAUDES_CONFIRM_EVERY=15
+  run cmd_update --dry-run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Check again every 15 seconds for 120 seconds"* ]]
+  [ ! -s "$W/sleeps" ]
+}
+
+@test "R6. a stale lock is taken by renaming it away, leaving nothing behind" {
+  mkdir -p "$CLAUDES_STATE_DIR/update.lock"; echo 999999 > "$CLAUDES_STATE_DIR/update.lock/pid"
+  run update_lock
+  [ "$status" -eq 0 ]
+  [ "$(cat "$CLAUDES_STATE_DIR/update.lock/pid")" != 999999 ]
+  [ -z "$(ls -d "$CLAUDES_STATE_DIR"/update.lock.stale.* 2>/dev/null || true)" ]
+}
+
+@test "R6b. when another run already renamed the stale lock away this run does not proceed" {
+  mkdir -p "$CLAUDES_STATE_DIR/update.lock"; echo 999999 > "$CLAUDES_STATE_DIR/update.lock/pid"
+  mv() { command mv "$CLAUDES_STATE_DIR/update.lock" "$CLAUDES_STATE_DIR/taken-elsewhere"; command mv "$@"; }
+  run update_lock
+  [ "$status" -eq 1 ]
+  [ ! -e "$CLAUDES_STATE_DIR/update.lock" ]
+}
+
+@test "R6c. a fresh live lock that slipped in before the rename is given back, not deleted" {
+  mkdir -p "$CLAUDES_STATE_DIR/update.lock"; echo 999999 > "$CLAUDES_STATE_DIR/update.lock/pid"
+  mv() { if [ ! -e "$W/slipped" ]; then touch "$W/slipped"; echo $$ > "$CLAUDES_STATE_DIR/update.lock/pid"; fi; command mv "$@"; }
+  run update_lock
+  [ "$status" -eq 1 ]
+  [ -d "$CLAUDES_STATE_DIR/update.lock" ]
+  [ -n "$(cat "$CLAUDES_STATE_DIR/update.lock/pid")" ]
+  [ "$(cat "$CLAUDES_STATE_DIR/update.lock/pid")" != 999999 ]
 }
