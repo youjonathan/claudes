@@ -11,6 +11,7 @@ CLAUDES_INSTALL_POLL="${CLAUDES_INSTALL_POLL:-2}"
 
 _INSTALL_PLIST_BUDDY=/usr/libexec/PlistBuddy
 _INSTALL_SHIPIT_LABEL="com.anthropic.claudefordesktop.ShipIt"
+INSTALL_SHIPIT_SUBMITTED=0   # 1 while the ShipIt job claudes submitted is loaded
 
 # SRC DEST -> moves a folder (every move goes through here so tests can make one fail)
 _install_mv() { mv "$1" "$2" 2>/dev/null; }
@@ -98,6 +99,7 @@ install_via_shipit() {
     echo "Could not start Claude's own installer."
     return 1
   fi
+  INSTALL_SHIPIT_SUBMITTED=1
   start="$(_install_now)"
   while :; do
     text="$(shipit_log_since "$offset")"
@@ -118,10 +120,20 @@ install_via_shipit() {
   done
   # submitted jobs restart themselves, so the job always goes
   launchctl remove "$_INSTALL_SHIPIT_LABEL" >/dev/null 2>&1 || true
+  INSTALL_SHIPIT_SUBMITTED=0
   [ "$ok" = 1 ] && return 0
   echo "Claude's own installer did not finish the update:"
   printf '%s\n' "$reason"
   return 1
+}
+
+# -> removes the ShipIt job claudes submitted, if it is still loaded (for an interrupted run); status 0
+install_shipit_cancel() {
+  if [ "${INSTALL_SHIPIT_SUBMITTED:-0}" = 1 ]; then
+    launchctl remove "$_INSTALL_SHIPIT_LABEL" >/dev/null 2>&1 || true
+    INSTALL_SHIPIT_SUBMITTED=0
+  fi
+  return 0
 }
 
 # NEWAPP -> moves the installed app aside and the new one in; status 1 (old app untouched or put back) when macOS or anything else blocks it
@@ -131,12 +143,20 @@ install_via_move() {
     echo "The new Claude is not where it should be ($new), so it cannot be moved in."
     return 1
   fi
+  if [ ! -d "$CLAUDES_APP_SRC" ]; then
+    echo "Claude is missing from $(dirname "$CLAUDES_APP_SRC") (the installer may have stopped half way), so there is no old app to move aside."
+    return 1
+  fi
   rm -rf "$CLAUDES_STATE_DIR/previous-moved"
   mkdir -p "$CLAUDES_STATE_DIR/previous-moved" 2>/dev/null || { echo "Could not create the folder $CLAUDES_STATE_DIR/previous-moved."; return 1; }
   if ! _install_mv "$CLAUDES_APP_SRC" "$aside"; then
-    echo "macOS blocked claudes from moving the old Claude out of the way. Nothing was changed."
-    echo "To allow it: open System Settings > Privacy & Security > App Management, turn on Terminal, then run claudes update again."
     rmdir "$CLAUDES_STATE_DIR/previous-moved" 2>/dev/null || true
+    if [ -d "$CLAUDES_APP_SRC" ]; then
+      echo "macOS blocked claudes from moving the old Claude out of the way. Nothing was changed."
+      echo "To allow it: open System Settings > Privacy & Security > App Management, turn on Terminal, then run claudes update again."
+    else
+      echo "Claude is now missing from $(dirname "$CLAUDES_APP_SRC") and could not be moved aside."
+    fi
     return 1
   fi
   if ! _install_mv "$new" "$CLAUDES_APP_SRC"; then
@@ -151,11 +171,18 @@ install_via_move() {
   return 0
 }
 
-# NEWAPP -> status 0 when the installed Claude is now NEWAPP's version; says which way it was installed
+# NEWAPP [VERSION] -> status 0 when the installed Claude is now NEWAPP's version; says which way it was installed.
+#    The caller backs up the old app first (install_backup_old). NEWAPP is checked again right before installing:
+#    status 3 (nothing installed, the failure recorded) when that check fails.
 install_new() {
-  local new="$1" want rc=0
-  want="$(_install_app_build "$new")" || { echo "Could not read the version of the new Claude at $new."; return 1; }
-  install_backup_old || return 1
+  local new="$1" want="${2:-}" built rc=0 reason
+  built="$(_install_app_build "$new")" || { echo "Could not read the version of the new Claude at $new."; return 1; }
+  [ -n "$want" ] || want="$built"
+  if ! reason="$(release_verify_app "$new" "$want")"; then
+    echo "The downloaded Claude failed its check just before installing ($reason), so nothing was installed."
+    _rel_fail "$want" "$reason" >/dev/null || true
+    return 3
+  fi
   install_via_shipit "$new" || rc=$?
   if [ "$rc" = 0 ]; then
     echo "Installed through Claude's own installer."
@@ -169,7 +196,7 @@ install_new() {
       return 1
     fi
   fi
-  [ "$(_install_app_build "$CLAUDES_APP_SRC" || true)" = "$want" ] || {
+  [ "$(_install_app_build "$CLAUDES_APP_SRC" || true)" = "$built" ] || {
     echo "The installed Claude is not the new version after all."
     return 1
   }
@@ -200,6 +227,7 @@ install_rollback() {
     return 1
   fi
   rm -rf "$CLAUDES_STATE_DIR/failed-new"
+  rm -f "$CLAUDES_SHIPIT_DIR/ShipItState.plist"   # claudes' own instruction file; left behind it reads as an update waiting
   echo "Put the old Claude back."
 }
 

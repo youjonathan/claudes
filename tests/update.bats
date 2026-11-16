@@ -4,9 +4,10 @@
 setup() {
   REPO="$(cd "$BATS_TEST_DIRNAME/.." && pwd)"
   W="$BATS_TEST_TMPDIR/world"
-  mkdir -p "$W/markers" "$W/busy" "$W/nostop" "$W/running.d"
+  mkdir -p "$W/Claude.app" "$W/confirm_busy" "$W/markers" "$W/busy" "$W/nostop" "$W/running.d"
   export CLAUDES_STATE_DIR="$W/state" CLAUDES_SUPPORT_DIR="$W/support" CLAUDES_APP_SRC="$W/Claude.app"
   export CLAUDES_LAUNCHAGENTS_DIR="$W/la" CLAUDES_APPS_DIR="$W/Apps"
+  export CLAUDES_CONFIRM_SECONDS=0 CLAUDES_CONFIRM_EVERY=1
   export CLAUDES_POLL=1 CLAUDES_INSTALL_TIMEOUT=6 CLAUDES_MARKER_GRACE=300 CLAUDES_MARKER_MAX_AGE=43200
   for f in common config instance procs update_detect release install update watch; do source "$REPO/lib/$f.sh"; done
 
@@ -40,6 +41,15 @@ setup() {
     [ "$n" -gt 0 ] || return 0
     echo $((n - 1)) > "$f"
     echo "Claude Code used 14s of CPU in 20s"
+    return 1
+  }
+  account_idle() {   # the confirmation phase's check: busy while the file holds a count above 0
+    local f="$W/confirm_busy/$(basename "$1")" n
+    [ -e "$f" ] || return 0
+    n="$(cat "$f")"
+    [ "$n" -gt 0 ] || return 0
+    echo $((n - 1)) > "$f"
+    echo "its window is in front"
     return 1
   }
   idle_rules_report() { echo "RULES-REPORT"; }
@@ -90,6 +100,7 @@ setup() {
   }
   release_ready_version() { release_ready_get version; }
   release_ready_app() { local a; a="$(release_ready_get app)" && [ -d "$a" ] && echo "$a"; }
+  eval "_real_$(declare -f release_prepare)"
   release_prepare() {
     echo prepare >> "$W/calls"
     if [ -e "$W/prepfail" ]; then echo "The download did not match its checksum."; return 1; fi
@@ -100,6 +111,7 @@ setup() {
   }
   release_discard() { echo discard >> "$W/calls"; rm -f "$CLAUDES_STATE_DIR/ready"; }
   install_shipit_path() { [ ! -e "$W/moveonly" ]; }
+  install_backup_old() { echo "backup (open copies: $(ls "$W/running.d" | wc -l | tr -d ' '))" >> "$W/calls"; [ ! -e "$W/backupfail" ] || { echo "Could not keep a copy of the current Claude."; return 1; }; }
   install_new() {
     echo "install $1 (open copies: $(ls "$W/running.d" | wc -l | tr -d ' '))" >> "$W/calls"
     [ ! -e "$W/installfail" ] || { echo "macOS blocked the move."; return 1; }
@@ -874,6 +886,7 @@ open $W/Apps/Claude C.app" ]
   [[ "$output" == *"Claude 1.101 is available (you have 1.100)"* ]]
   [[ "$output" == *"Claude updated: 1.100 (build 100) -> 1.101 (build 101)"* ]]
   [ "$(cat "$W/calls")" = "prepare
+backup (open copies: 3)
 install $W/new/Claude.app (open copies: 0)
 finish
 discard" ]
@@ -1105,4 +1118,199 @@ open $W/Apps/Claude C.app" ]
   [[ "$output" == *"Claude A: idle"* ]]
   [[ "$output" == *"RULES-REPORT"* ]]
   [ ! -e "$W/state" ]
+}
+
+# ---- review fixes: rollback memory, second check, interrupts, repair, backup order, confirmation, lock ----
+
+crash_on_first_launch() {   # the new version dies during the first-launch wait
+  claudes_sleep() {
+    echo "$1" >> "$W/sleeps"; echo $(( $(cat "$W/clock") + 1 )) > "$W/clock"
+    if [ "$1" = 20 ] && [ "$(cat "$W/build")" = 101 ]; then rm -f "$W/running.d/"*; fi
+  }
+}
+
+@test "R1. after a rollback the version is recorded as failed and the next cycle quits nobody" {
+  release_world; run_up Claude Claude-3p
+  crash_on_first_launch
+  run cmd_update
+  [ "$status" -eq 1 ]
+  grep -qx rollback "$W/calls"
+  [ "$(awk -F'\t' '$1=="version"{print $2}' "$CLAUDES_STATE_DIR/release-failed")" = 1.101 ]
+  grep -q '^reason' "$CLAUDES_STATE_DIR/release-failed"
+  grep -q '^at' "$CLAUDES_STATE_DIR/release-failed"
+  [ ! -e "$CLAUDES_STATE_DIR/ready" ]
+  # second cycle: the real release_prepare sees the record and pauses
+  release_prepare() { _real_release_prepare; }
+  : > "$W/events"; : > "$W/calls"
+  run cmd_update
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"failed its checks"* ]]
+  [[ "$output" == *"nothing was quit"* ]]
+  ! grep -q '^stop ' "$W/events"
+  ! grep -q '^install' "$W/calls"
+  ! grep -q '^backup' "$W/calls"
+}
+
+@test "R1b. a failed rollback records the version too" {
+  release_world; run_up Claude
+  crash_on_first_launch
+  install_rollback() { echo rollback >> "$W/calls"; return 1; }
+  run cmd_update
+  [ "$status" -eq 1 ]
+  [ "$(awk -F'\t' '$1=="version"{print $2}' "$CLAUDES_STATE_DIR/release-failed")" = 1.101 ]
+}
+
+@test "R2. the old app is backed up before anyone is quit" {
+  release_world; run_up Claude Claude-3p
+  run cmd_update
+  [ "$status" -eq 0 ]
+  [ "$(sed -n 2p "$W/calls")" = "backup (open copies: 2)" ]
+}
+
+@test "R2b. a failed backup quits nothing, installs nothing and says so" {
+  release_world; run_up Claude Claude-3p
+  touch "$W/backupfail"
+  run cmd_update
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"The old Claude could not be saved, so nothing was quit."* ]]
+  [ ! -s "$W/events" ]
+  ! grep -q '^install' "$W/calls"
+  [ -e "$W/running.d/Claude" ] && [ -e "$W/running.d/Claude-3p" ]
+  [ -n "$(release_ready_version)" ]
+}
+
+@test "R3. a failed install that left Claude.app missing is rolled back before reopening" {
+  release_world; run_up Claude Claude-3p
+  install_new() { echo "macOS blocked the move."; rm -rf "$CLAUDES_APP_SRC"; return 1; }
+  install_rollback() { echo rollback >> "$W/calls"; mkdir -p "$CLAUDES_APP_SRC"; echo 100 > "$W/build"; }
+  run cmd_update
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Claude is missing from Applications. Putting the old version back."* ]]
+  grep -qx rollback "$W/calls"
+  [ "$(events | grep -c '^open ')" = 2 ]
+  [ -d "$CLAUDES_APP_SRC" ]
+}
+
+@test "R3b. a failed install that left an unexpected version is rolled back" {
+  release_world; run_up Claude
+  install_new() { echo 777 > "$W/build"; return 1; }
+  run cmd_update
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"unexpected state (version 777)"* ]]
+  grep -qx rollback "$W/calls"
+}
+
+@test "R3c. a failed install that left the old version in place needs no rollback" {
+  release_world; run_up Claude
+  touch "$W/installfail"
+  run cmd_update
+  [ "$status" -eq 1 ]
+  ! grep -qx rollback "$W/calls"
+}
+
+@test "R3d. when the rollback also fails the message says where the backup is" {
+  release_world; run_up Claude
+  install_new() { rm -rf "$CLAUDES_APP_SRC"; return 1; }
+  install_rollback() { echo "The old Claude could not be moved back."; return 1; }
+  run cmd_update
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"$CLAUDES_STATE_DIR/previous/Claude.app"* ]]
+  [[ "$output" == *"Reopening your accounts"* ]]
+}
+
+@test "R4. Ctrl-C before ShipIt starts copying removes the ShipIt job and puts a missing app back before reopening" {
+  release_world; run_up Claude Claude-3p
+  launchctl() { echo "launchctl $*" >> "$W/launchctl.log"; return 0; }
+  install_new() {
+    INSTALL_SHIPIT_SUBMITTED=1; rm -rf "$CLAUDES_APP_SRC"
+    bash -c 'echo $PPID' > "$W/me"; kill -TERM "$(cat "$W/me")"
+  }
+  install_rollback() { echo rollback >> "$W/calls"; mkdir -p "$CLAUDES_APP_SRC"; }
+  run cmd_update
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Interrupted"* ]]
+  grep -qx 'launchctl remove com.anthropic.claudefordesktop.ShipIt' "$W/launchctl.log"
+  grep -qx rollback "$W/calls"
+  [ "$(events | grep -c '^open ')" = 2 ]
+  [ ! -e "$CLAUDES_STATE_DIR/update.lock" ]
+}
+
+@test "R4b. Ctrl-C with nothing submitted and the app in place removes no job and rolls nothing back" {
+  release_world; run_up Claude
+  launchctl() { echo "launchctl $*" >> "$W/launchctl.log"; return 0; }
+  install_new() { bash -c 'echo $PPID' > "$W/me"; kill -TERM "$(cat "$W/me")"; }
+  run cmd_update
+  [ "$status" -eq 1 ]
+  [ ! -e "$W/launchctl.log" ]
+  ! grep -qx rollback "$W/calls"
+  [ "$(events | grep -c '^open ')" = 1 ]
+}
+
+@test "R5. the idle confirmation: a busy check aborts the attempt, nothing is quit until a whole quiet round" {
+  release_world; run_up Claude Claude-3p
+  export CLAUDES_CONFIRM_SECONDS=30 CLAUDES_CONFIRM_EVERY=10
+  echo 1 > "$W/confirm_busy/Claude-3p"
+  run cmd_update
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Claude C is busy: its window is in front"* ]]
+  [[ "$output" == *"Waiting until every account is idle"* ]]
+  [[ "$output" == *"Claude updated"* ]]
+  [ "$(grep -cx 10 "$W/sleeps")" = 4 ]     # 1 round before the abort, 3 on the second attempt
+  [ "$(events | grep -c '^stop ')" = 2 ]
+}
+
+@test "R5b. under the watcher a busy confirmation quits nothing and exits 0" {
+  release_world; run_up Claude Claude-3p
+  export CLAUDES_CONFIRM_SECONDS=30 CLAUDES_CONFIRM_EVERY=10
+  echo 2 > "$W/confirm_busy/Claude"
+  run cmd_update --watch-run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Claude A is busy"* ]]
+  [[ "$output" == *"Not updating now"* ]]
+  ! grep -q '^stop ' "$W/events"
+  ! grep -q '^install' "$W/calls"
+}
+
+@test "R5c. every account quiet through the whole confirmation: it goes ahead after the full wait" {
+  release_world; run_up Claude
+  export CLAUDES_CONFIRM_SECONDS=120 CLAUDES_CONFIRM_EVERY=15
+  run cmd_update
+  [ "$status" -eq 0 ]
+  [ "$(grep -cx 15 "$W/sleeps")" = 8 ]
+  [[ "$output" == *"Claude updated"* ]]
+}
+
+@test "R5d. a dry run skips the confirmation wait but says it would do it" {
+  release_world; run_up Claude
+  export CLAUDES_CONFIRM_SECONDS=120 CLAUDES_CONFIRM_EVERY=15
+  run cmd_update --dry-run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Check again every 15 seconds for 120 seconds"* ]]
+  [ ! -s "$W/sleeps" ]
+}
+
+@test "R6. a stale lock is taken by renaming it away, leaving nothing behind" {
+  mkdir -p "$CLAUDES_STATE_DIR/update.lock"; echo 999999 > "$CLAUDES_STATE_DIR/update.lock/pid"
+  run update_lock
+  [ "$status" -eq 0 ]
+  [ "$(cat "$CLAUDES_STATE_DIR/update.lock/pid")" != 999999 ]
+  [ -z "$(ls -d "$CLAUDES_STATE_DIR"/update.lock.stale.* 2>/dev/null || true)" ]
+}
+
+@test "R6b. when another run already renamed the stale lock away this run does not proceed" {
+  mkdir -p "$CLAUDES_STATE_DIR/update.lock"; echo 999999 > "$CLAUDES_STATE_DIR/update.lock/pid"
+  mv() { command mv "$CLAUDES_STATE_DIR/update.lock" "$CLAUDES_STATE_DIR/taken-elsewhere"; command mv "$@"; }
+  run update_lock
+  [ "$status" -eq 1 ]
+  [ ! -e "$CLAUDES_STATE_DIR/update.lock" ]
+}
+
+@test "R6c. a fresh live lock that slipped in before the rename is given back, not deleted" {
+  mkdir -p "$CLAUDES_STATE_DIR/update.lock"; echo 999999 > "$CLAUDES_STATE_DIR/update.lock/pid"
+  mv() { if [ ! -e "$W/slipped" ]; then touch "$W/slipped"; echo $$ > "$CLAUDES_STATE_DIR/update.lock/pid"; fi; command mv "$@"; }
+  run update_lock
+  [ "$status" -eq 1 ]
+  [ -d "$CLAUDES_STATE_DIR/update.lock" ]
+  [ -n "$(cat "$CLAUDES_STATE_DIR/update.lock/pid")" ]
+  [ "$(cat "$CLAUDES_STATE_DIR/update.lock/pid")" != 999999 ]
 }
