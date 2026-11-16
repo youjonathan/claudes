@@ -39,6 +39,7 @@ setup() {
   claudes_sleep() { if [ -f "$T/procs2" ]; then cp "$T/procs2" "$T/procs"; fi; }
   : > "$T/procs"; : > "$T/mainprocs"
   stub_lsappinfo
+  echo 999 > "$T/front"   # some other app in front by default
   stub_windows_bin
   set -euo pipefail   # the real script runs this way
 }
@@ -332,6 +333,7 @@ DD() { echo "$CLAUDES_SUPPORT_DIR/Claude-3p"; }
 }
 
 @test "front_app_pid: status 1 when lsappinfo knows nothing" {
+  rm -f "$T/front"
   run front_app_pid
   [ "$status" -eq 1 ]
   [ -z "$output" ]
@@ -434,14 +436,29 @@ EOS
   [ "$output" = "its window is in front" ]
 }
 
-@test "account_idle: another app in front or unknown front is not busy" {
+@test "account_idle: another app in front is not busy" {
   mkrunning
   echo 999 > "$T/front"
   run account_idle "$(DD)"
   [ "$status" -eq 0 ]
-  rm "$T/front"
+}
+
+@test "account_idle: lsappinfo failing is busy with a reason and is logged" {
+  mkrunning
+  rm -f "$T/front"
   run account_idle "$(DD)"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"could not check which app is in front"* ]]
+  grep -q "could not check which app is in front" "$CLAUDES_LOG_DIR/update.log"
+}
+
+@test "account_idle: dry run does not count a failing lsappinfo as busy" {
+  mkrunning
+  rm -f "$T/front"
+  CLAUDES_IDLE_READONLY=1 run account_idle "$(DD)"
   [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  [ ! -e "$CLAUDES_LOG_DIR/update.log" ]
 }
 
 @test "account_idle: busy when a window is full screen" {
@@ -459,12 +476,32 @@ EOS
   [ "$status" -eq 0 ]
 }
 
-@test "account_idle: full-screen helper failing means could not tell, not busy" {
+@test "account_idle: full-screen helper failing is busy, names the fix and is logged" {
   mkrunning
   touch "$T/fs-fail"
   run account_idle "$(DD)"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"could not check for full-screen windows"* ]]
+  [[ "$output" == *"xcode-select --install"* ]]
+  grep -q "xcode-select --install" "$CLAUDES_LOG_DIR/update.log"
+}
+
+@test "account_idle: dry run does not count a failing full-screen helper as busy" {
+  mkrunning
+  touch "$T/fs-fail"
+  CLAUDES_IDLE_READONLY=1 run account_idle "$(DD)"
   [ "$status" -eq 0 ]
   [ -z "$output" ]
+  [ ! -e "$CLAUDES_LOG_DIR/update.log" ]
+}
+
+@test "idle_rules_report: notes both checks that cannot run and names the fix" {
+  rm -f "$T/front"; touch "$T/fs-fail"
+  run idle_rules_report
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"lsappinfo failed"* ]]
+  [[ "$output" == *"xcode-select --install"* ]]
+  [[ "$output" != *"counted as not busy"* ]]
 }
 
 @test "account_idle: busy by recent Claude Code session file" {
@@ -603,7 +640,7 @@ IS() { echo "$CLAUDES_STATE_DIR/idle-since"; }
   [ "$output" = "its window is in front" ]
   [ "$(cat "$(IS)")" = "$(printf 'other\t7\t5')" ]
   # idle again afterwards: the countdown starts from zero
-  rm "$T/front"
+  echo 999 > "$T/front"
   fake_now 1500
   run account_idle_settled "$(DD)"
   [ "$output" = "quiet for 0 of 10 minutes" ]

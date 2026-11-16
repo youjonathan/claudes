@@ -270,19 +270,43 @@ _recent_minutes() {
   [ "$age" -lt $(( CLAUDES_IDLE_MINUTES * 60 )) ]
 }
 
+# TEXT -> append a timestamped line to update.log (real runs only; never fails)
+_idle_log() {
+  mkdir -p "$CLAUDES_LOG_DIR" 2>/dev/null || return 0
+  printf '%s idle check: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$CLAUDES_LOG_DIR/update.log" 2>/dev/null || true
+}
+
 # DATADIR -> status 0 when idle; prints a short plain reason on stdout when busy; not running -> idle.
 # Copies Claude's own idle rules in order: window in front, full screen, session files, CPU.
+# A rule that cannot run (lsappinfo or the full-screen helper failing) counts as busy and is logged, except in
+# a dry run (CLAUDES_IDLE_READONLY=1), where idle_rules_report says so instead.
 account_idle() {
-  local dir="$1" pid front fs newest c1 c2 delta
+  local dir="$1" pid front fs newest c1 c2 delta reason
   pid="$(_idle_main_pid "$dir")"
   [ -n "$pid" ] || return 0
 
-  if front="$(front_app_pid)" && [ "$front" = "$pid" ]; then
-    echo "its window is in front"
+  if front="$(front_app_pid)"; then
+    if [ "$front" = "$pid" ]; then
+      echo "its window is in front"
+      return 1
+    fi
+  elif [ "${CLAUDES_IDLE_READONLY:-0}" != 1 ]; then
+    reason="could not check which app is in front (lsappinfo failed); the update waits until it works"
+    _idle_log "$reason"
+    echo "$reason"
     return 1
   fi
 
-  fs="$(fullscreen_pids 2>/dev/null || true)"
+  if fs="$(fullscreen_pids 2>/dev/null)"; then
+    :
+  elif [ "${CLAUDES_IDLE_READONLY:-0}" != 1 ]; then
+    reason="could not check for full-screen windows (the Swift helper would not build or run); install Xcode Command Line Tools with: xcode-select --install"
+    _idle_log "$reason"
+    echo "$reason"
+    return 1
+  else
+    fs=""
+  fi
   if grep -Fxq -- "$pid" <<<"$fs"; then
     echo "a window is full screen"
     return 1
@@ -391,9 +415,9 @@ idle_rules_report() {
   echo "    - a /loop or scheduled wake-up waiting inside a quiet session"
   echo "    - a claude.ai chat reply that is still streaming"
   front_app_pid >/dev/null 2>&1 \
-    || echo "  Note: could not tell which app is in front on this Mac, so that rule is skipped (counted as not busy)."
+    || echo "  Note: could not tell which app is in front on this Mac (lsappinfo failed). A real update counts every open account as busy until that works."
   fullscreen_pids >/dev/null 2>&1 \
-    || echo "  Note: could not check for full-screen windows on this Mac, so that rule is skipped (counted as not busy)."
+    || echo "  Note: could not check for full-screen windows on this Mac (needs the Swift tools). A real update counts every open account as busy until you install Xcode Command Line Tools: xcode-select --install"
   return 0
 }
 
