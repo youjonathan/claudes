@@ -50,7 +50,10 @@ SH
   chmod +x "$T/bin/"*
   source "$REPO/lib/common.sh"
   source "$REPO/lib/update_detect.sh"
+  source "$REPO/lib/release.sh"
   source "$REPO/lib/install.sh"
+  # the real check needs codesign/spctl on a real app; here it passes unless told to fail
+  release_verify_app() { echo "verify $1 $2" >> "$T/verify.log"; [ ! -f "$T/verify_fail" ] || { echo "the downloaded Claude app's signature is damaged or incomplete"; return 1; }; }
   set -euo pipefail
 }
 
@@ -79,13 +82,27 @@ shipit_does() { # LOGLINE [swap]
   [[ "$output" == *"nothing was installed"* ]]
 }
 
-@test "install_new installs nothing when the backup fails" {
-  touch "$T/ditto_fail"
-  run install_new "$T/new/Claude.app"
-  [ "$status" -eq 1 ]
-  [ "$(cat "$CLAUDES_APP_SRC/Contents/marker")" = 100 ]
+@test "install_new checks the download again right before installing, with the announced version" {
+  shipit_does "Installation completed successfully" swap
+  run install_new "$T/new/Claude.app" 200
+  [ "$status" -eq 0 ]
+  [ "$(cat "$T/verify.log")" = "verify $T/new/Claude.app 200" ]
+}
+
+@test "install_new: a download that fails the second check installs nothing and records the failure" {
+  touch "$T/verify_fail"
+  mkdir -p "$T/state/download/200"
+  printf 'version\t200\n' > "$T/state/ready"
+  run install_new "$T/new/Claude.app" 200
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"failed its check just before installing"* ]]
+  [ "$(installed_build)" = 100 ]
   [ -d "$T/new/Claude.app" ]
   [ ! -f "$T/launchctl.log" ]
+  [ ! -e "$T/state/previous-moved" ]
+  [ "$(awk -F'\t' '$1=="version"{print $2}' "$T/state/release-failed")" = 200 ]
+  grep -q '^reason' "$T/state/release-failed"
+  [ ! -e "$T/state/ready" ]
 }
 
 @test "install_shipit_path finds ShipIt when the team matches" {
@@ -193,13 +210,12 @@ shipit_does() { # LOGLINE [swap]
   grep -q '^remove com.anthropic.claudefordesktop.ShipIt$' "$T/launchctl.log"
 }
 
-@test "install_new through ShipIt keeps a backup and says which way" {
+@test "install_new through ShipIt says which way" {
   shipit_does "Installation completed successfully" swap
   run install_new "$T/new/Claude.app"
   [ "$status" -eq 0 ]
   [[ "$output" == *"Installed through Claude's own installer"* ]]
   [ "$(installed_build)" = 200 ]
-  [ "$(cat "$T/state/previous/Claude.app/Contents/marker")" = 100 ]
 }
 
 @test "install_new falls to the move when ShipIt is missing" {
@@ -350,4 +366,49 @@ shipit_does() { # LOGLINE [swap]
 @test "install_finish works with nothing to clean" {
   run install_finish
   [ "$status" -eq 0 ]
+}
+
+@test "install_via_shipit has the submitted flag up while it waits and clears it at the end" {
+  : > "$T/shipit_script"
+  _install_sleep() { echo "$INSTALL_SHIPIT_SUBMITTED" >> "$T/flag.log"; sleep 0.1; }
+  install_via_shipit "$T/new/Claude.app" || true
+  grep -qx 1 "$T/flag.log"
+  [ "$INSTALL_SHIPIT_SUBMITTED" = 0 ]
+}
+
+@test "install_shipit_cancel removes the job only when one was submitted" {
+  : > "$T/launchctl.log"
+  install_shipit_cancel
+  [ ! -s "$T/launchctl.log" ]
+  INSTALL_SHIPIT_SUBMITTED=1
+  install_shipit_cancel
+  grep -q '^remove com.anthropic.claudefordesktop.ShipIt$' "$T/launchctl.log"
+  [ "$INSTALL_SHIPIT_SUBMITTED" = 0 ]
+}
+
+@test "install_via_move: app missing from Applications says so, not 'nothing was changed'" {
+  rm -rf "$CLAUDES_APP_SRC"
+  run install_via_move "$T/new/Claude.app"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"missing"* ]]
+  [[ "$output" != *"Nothing was changed"* ]]
+  [ -d "$T/new/Claude.app" ]
+}
+
+@test "install_via_move: the move fails and the app is gone afterwards: no false 'nothing was changed'" {
+  _install_mv() { rm -rf "$1"; return 1; }
+  run install_via_move "$T/new/Claude.app"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"missing"* ]]
+  [[ "$output" != *"Nothing was changed"* ]]
+}
+
+@test "install_rollback clears claudes' own ShipItState.plist" {
+  install_backup_old
+  rm -rf "$CLAUDES_APP_SRC"; mkapp "$CLAUDES_APP_SRC" 200
+  echo x > "$CLAUDES_SHIPIT_DIR/ShipItState.plist"
+  run install_rollback
+  [ "$status" -eq 0 ]
+  [ "$(installed_build)" = 100 ]
+  [ ! -e "$CLAUDES_SHIPIT_DIR/ShipItState.plist" ]
 }

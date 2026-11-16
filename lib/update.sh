@@ -14,6 +14,8 @@ UPDATE_NOTBACK=""          # lines DATADIR<TAB>LAUNCHER of accounts that did not
 CLAUDES_PENDING_MAX_AGE="${CLAUDES_PENDING_MAX_AGE:-86400}"   # reopen-pending older than this is ignored
 CLAUDES_NOTICE_AFTER="${CLAUDES_NOTICE_AFTER:-604800}"         # a verified download this old triggers the one-time notice
 CLAUDES_TERMINAL_BACKOFF="${CLAUDES_TERMINAL_BACKOFF:-86400}"  # the watcher waits this long after asking for Terminal
+CLAUDES_CONFIRM_SECONDS="${CLAUDES_CONFIRM_SECONDS:-120}"   # last look at "everyone idle" right before quitting: how long
+CLAUDES_CONFIRM_EVERY="${CLAUDES_CONFIRM_EVERY:-15}"        # ... and how often to check in that time
 CLAUDES_FIRST_LAUNCH_WAIT="${CLAUDES_FIRST_LAUNCH_WAIT:-20}"   # seconds before checking the reopened accounts are still up
 
 claudes_open() { open "$@"; }   # every open goes through here so tests can replace it
@@ -152,6 +154,11 @@ _update_on_interrupt() {
     _update_say "Claude's installer is running. The next 'claudes update' (or the background helper) will reopen your accounts."
     _update_say "They are listed in $(update_pending_file)."
   else
+    install_shipit_cancel || true
+    if [ ! -d "$CLAUDES_APP_SRC" ]; then
+      _update_say "Claude is missing from Applications; putting the old version back first."
+      install_rollback || _update_say "The old Claude is saved at $CLAUDES_STATE_DIR/previous/Claude.app; drag it into Applications."
+    fi
     _update_say "Reopening the accounts that were closed."
     update_reopen_accounts || true
   fi
@@ -363,13 +370,45 @@ _update_needs_terminal() {
   release_ready_set needs_terminal "$(claudes_now)" || true
 }
 
+# -> last look right before quitting: every account still idle at each check, every $CLAUDES_CONFIRM_EVERY seconds for
+#    $CLAUDES_CONFIRM_SECONDS seconds. Status 0 all quiet; 1 with "NAME is busy: reason" lines when anything was used.
+_update_confirm_idle() {
+  local every="$CLAUDES_CONFIRM_EVERY" rounds d l n reason i=0 busy=""
+  case "$every" in ''|*[!0-9]*|0) every=15;; esac
+  case "$CLAUDES_CONFIRM_SECONDS" in ''|*[!0-9]*) rounds=0;; *) rounds=$(( CLAUDES_CONFIRM_SECONDS / every ));; esac
+  [ -n "$UPDATE_ACCOUNTS" ] || return 0
+  [ "$rounds" -gt 0 ] || return 0
+  echo "Every account looks idle. Checking once more for $CLAUDES_CONFIRM_SECONDS seconds before quitting anything." >&2
+  while [ "$i" -lt "$rounds" ]; do
+    claudes_sleep "$every"
+    while IFS=$'\t' read -r d l; do
+      [ -n "$d" ] || continue
+      if ! reason="$(account_idle "$d")"; then
+        n="$(update_account_name "$d" "$l")"
+        if [ -n "$reason" ]; then busy="$busy$n is busy: $reason"$'\n'; else busy="$busy$n is busy."$'\n'; fi
+      fi
+    done <<EOF
+$UPDATE_ACCOUNTS
+EOF
+    if [ -n "$busy" ]; then
+      printf '%s' "$busy"
+      echo "Something was used during the last check, so nothing was quit." >&2
+      return 1
+    fi
+    i=$((i + 1))
+  done
+  return 0
+}
+
 # KIND(ready|waiting) -> real runs only: wait until every open account is idle, with no time limit.
 #    Status 0 go ahead and quit; 2 stop here and report success (busy under the watcher, or the update went away).
 _update_wait_idle() {
   local kind="$1" busy last="" state
   while :; do
     UPDATE_ACCOUNTS="$(update_open_accounts)"
-    if busy="$(update_all_idle)"; then return 0; fi
+    if busy="$(update_all_idle)"; then
+      if busy="$(_update_confirm_idle)"; then return 0; fi
+    fi
     if [ "$UPDATE_WATCH" = 1 ]; then
       echo "$busy"
       echo "Not updating now. The background helper will try again later."
@@ -394,10 +433,41 @@ _update_wait_idle() {
   done
 }
 
-# -> every account is idle: quit them together, install the verified Claude, reopen, and check the first launch; status 0/1
+# VERSION REASON -> remember that this version failed (release.sh's release-failed record, so its retry pause applies) and forget the download
+_update_record_failed() {
+  [ -n "${1:-}" ] || return 0
+  _rel_fail "$1" "$2" >/dev/null || true
+  return 0
+}
+
+# OLDBUILD NEWBUILD -> after a failed install: if Claude.app is missing or is neither version, put the old one back
+_update_repair_app() {
+  local old="$1" new="$2" cur
+  if [ -d "$CLAUDES_APP_SRC" ]; then
+    cur="$(installed_build 2>/dev/null || true)"
+    if [ -n "$cur" ] && { [ "$cur" = "$old" ] || [ "$cur" = "$new" ]; }; then return 0; fi
+    echo "Claude in Applications is in an unexpected state (version ${cur:-unreadable}). Putting the old version back."
+  else
+    echo "Claude is missing from Applications. Putting the old version back."
+  fi
+  if ! install_rollback; then
+    echo "The old Claude is saved at $CLAUDES_STATE_DIR/previous/Claude.app. Drag it into Applications in Finder."
+    return 1
+  fi
+  return 0
+}
+
+# -> every account is idle: back up, quit them together, install the verified Claude, reopen, and check the first launch; status 0/1
 _update_install_and_reopen() {
-  local newapp old_ver old_build d l up=0 reopen_rc=0
+  local newapp new_v new_build old_ver old_build d l up=0 reopen_rc=0 irc=0
   newapp="$(release_ready_app)" || { echo "The downloaded update is gone. Nothing was quit."; return 1; }
+  new_v="$(release_ready_version 2>/dev/null || true)"
+
+  # the 400 MB copy of the old app comes first: a full disk stops the update before anyone is quit
+  if ! install_backup_old; then
+    echo "The old Claude could not be saved, so nothing was quit."
+    return 1
+  fi
 
   if [ -z "$UPDATE_ACCOUNTS" ]; then echo "No Claude copy is open, so nothing needs quitting."; fi
   if ! update_quit_all; then
@@ -406,9 +476,13 @@ _update_install_and_reopen() {
     return 1
   fi
   old_ver="$UPDATE_OLD_VERSION"; old_build="$UPDATE_OLD_BUILD"
+  new_build="$(_install_app_build "$newapp" 2>/dev/null || true)"
 
-  if ! install_new "$newapp"; then
-    echo "The new Claude could not be installed. Reopening your accounts on the old version."
+  install_new "$newapp" "$new_v" || irc=$?
+  if [ "$irc" != 0 ]; then
+    echo "The new Claude could not be installed."
+    _update_repair_app "$old_build" "$new_build" || true
+    echo "Reopening your accounts on the old version."
     update_reopen_accounts || true
     if [ "$UPDATE_WATCH" = 1 ]; then _update_needs_terminal; fi
     return 1
@@ -426,6 +500,7 @@ $UPDATE_ACCOUNTS
 EOF
     if [ "$up" = 0 ]; then
       echo "None of your accounts stayed open on the new Claude. Putting the old version back."
+      _update_record_failed "$new_v" "it did not stay open when first launched"
       if install_rollback; then
         _update_pending_write "$UPDATE_ACCOUNTS" "" "" "$UPDATE_LOG_OFFSET"
         update_reopen_accounts || true
@@ -532,6 +607,7 @@ _update_print_plan() {
   else
     echo "  1. Wait until every open account is idle (they all are right now)."
   fi
+  echo "  1b. Check again every $CLAUDES_CONFIRM_EVERY seconds for $CLAUDES_CONFIRM_SECONDS seconds; if anything is busy, go back to waiting (skipped in a dry run)."
   echo "  2. Quit these together: $(update_names_of "$UPDATE_ACCOUNTS")"
   if [ "$kind" = release ]; then
     echo "  3. Hand the checked Claude to Claude's own installer (or move the app into place if that is not possible)."
@@ -933,7 +1009,7 @@ update_safety_net() {
 
 # -> take $CLAUDES_STATE_DIR/update.lock (pid file inside); status 1 if busy
 update_lock() {
-  local lock="$CLAUDES_STATE_DIR/update.lock" pid
+  local lock="$CLAUDES_STATE_DIR/update.lock" pid stale
   mkdir -p "$CLAUDES_STATE_DIR"
   if ! mkdir "$lock" 2>/dev/null; then
     pid="$(cat "$lock/pid" 2>/dev/null || true)"
@@ -942,7 +1018,14 @@ update_lock() {
       pid="$(cat "$lock/pid" 2>/dev/null || true)"
     fi
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then return 1; fi
-    rm -rf "$lock"
+    # take over a stale lock by renaming it away: only one run's rename can succeed
+    stale="$lock.stale.$$.$RANDOM"
+    mv "$lock" "$stale" 2>/dev/null || return 1
+    if [ "$(cat "$stale/pid" 2>/dev/null || true)" != "$pid" ]; then
+      mv "$stale" "$lock" 2>/dev/null || rm -rf "$stale"   # that was another run's fresh lock: give it back
+      return 1
+    fi
+    rm -rf "$stale"
     mkdir "$lock" 2>/dev/null || return 1
   fi
   echo $$ > "$lock/pid"
