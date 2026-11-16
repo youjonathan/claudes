@@ -1218,6 +1218,26 @@ crash_on_first_launch() {   # the new version dies during the first-launch wait
   [[ "$output" == *"Reopening your accounts"* ]]
 }
 
+@test "R3e. under the watcher, a download that failed its last-moment check (status 3) sends no false Terminal notice" {
+  release_world; run_up Claude
+  install_new() { rm -f "$CLAUDES_STATE_DIR/ready"; return 3; }   # what _rel_fail leaves behind
+  run cmd_update --watch-run
+  [ "$status" -eq 1 ]
+  [[ "$output" != *"needs Terminal"* ]]
+  [ ! -e "$W/notes" ]
+  [ ! -e "$CLAUDES_STATE_DIR/ready" ]
+}
+
+@test "R3f. under the watcher, status 1 with the download still good asks for Terminal once" {
+  release_world; run_up Claude
+  touch "$W/installfail"
+  run cmd_update --watch-run
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"needs Terminal"* ]]
+  grep -q "run claudes update in Terminal" "$W/notes"
+  [ -n "$(release_ready_get needs_terminal)" ]
+}
+
 @test "R4. Ctrl-C before ShipIt starts copying removes the ShipIt job and puts a missing app back before reopening" {
   release_world; run_up Claude Claude-3p
   launchctl() { echo "launchctl $*" >> "$W/launchctl.log"; return 0; }
@@ -1257,6 +1277,41 @@ crash_on_first_launch() {   # the new version dies during the first-launch wait
   [[ "$output" == *"Claude updated"* ]]
   [ "$(grep -cx 10 "$W/sleeps")" = 4 ]     # 1 round before the abort, 3 on the second attempt
   [ "$(events | grep -c '^stop ')" = 2 ]
+}
+
+@test "R5-1. a busy confirmation restarts that account's idle clock: the second attempt needs 10 full quiet minutes" {
+  release_world; run_up Claude
+  eval "$(sed -n '/^account_idle_settled()/,/^}/p' "$REPO/lib/update_detect.sh")"   # the real countdown, over the fake account_idle
+  export CLAUDES_CONFIRM_SECONDS=10 CLAUDES_CONFIRM_EVERY=10 CLAUDES_IDLE_MINUTES=10 CLOCK_STEP=60
+  mkdir -p "$CLAUDES_STATE_DIR"
+  printf '%s\t100\t%s\n' "$A" $(( $(claudes_now) - 700 )) > "$CLAUDES_STATE_DIR/idle-since"   # already quiet for 11 minutes
+  echo 1 > "$W/confirm_busy/Claude"
+  run cmd_update
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Claude A is busy: its window is in front"* ]] || false
+  [[ "$output" == *"quiet for 0 of 10 minutes"* ]] || false     # the clock started over, it did not pass at once
+  [[ "$output" == *"Claude updated"* ]] || false
+  [ "$(grep -cx 1 "$W/sleeps")" -ge 9 ]                # about 10 minutes of waiting at 60 s per poll
+}
+
+@test "R5-2. the confirmation checks every account at the same time" {
+  run_up Claude Claude-3p Claude-Acct-D
+  UPDATE_ACCOUNTS="$(update_open_accounts)"
+  export CLAUDES_CONFIRM_SECONDS=10 CLAUDES_CONFIRM_EVERY=10
+  account_idle() { echo "start" >> "$W/par"; sleep 0.5; echo "end" >> "$W/par"; return 0; }
+  run _update_confirm_idle
+  [ "$status" -eq 0 ]
+  [ "$(head -n 3 "$W/par" | grep -c start)" = 3 ]      # all three began before any finished
+}
+
+@test "R5-3. the confirmation is bounded by the clock, not by the number of rounds" {
+  run_up Claude
+  UPDATE_ACCOUNTS="$(update_open_accounts)"
+  export CLAUDES_CONFIRM_SECONDS=120 CLAUDES_CONFIRM_EVERY=15
+  account_idle() { echo $(( $(cat "$W/clock") + 20 )) > "$W/clock"; return 0; }   # each check takes 20 s, like the CPU sample
+  run _update_confirm_idle
+  [ "$status" -eq 0 ]
+  [ "$(grep -cx 15 "$W/sleeps")" = 4 ]                 # 35 s per round: 120 s is over after 4 rounds, not 8
 }
 
 @test "R5b. under the watcher a busy confirmation quits nothing and exits 0" {

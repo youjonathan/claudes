@@ -92,9 +92,9 @@ own updater may close your accounts one at a time by itself when an update arriv
    `CLAUDES_RELEASE_CHECK_EVERY`),
 2. downloads it with `curl` and verifies it: signed by Anthropic's team ID (`Q6L2SF6YDW`), the
    published checksum and size, the exact version, and a macOS `spctl` check,
-3. saves a copy of the current Claude, so it can be put back,
-4. waits until every open account is idle at the same moment (see "What counts as idle"),
+3. waits until every open account is idle at the same moment (see "What counts as idle"),
    with no time limit,
+4. saves a copy of the current Claude, so it can be put back,
 5. quits them all together,
 6. checks the download again, then installs it by handing it to Claude's own installer
    (ShipIt). If that isn't possible, it moves the app into place itself instead, which needs
@@ -128,7 +128,8 @@ never all idle at once, the helper shows one notification per version. Run `clau
 Terminal to see what is busy.
 
 If you close the Terminal during a run, the run carries on without it and writes its messages to
-`~/Library/Logs/claudes/update.log`.
+`~/Library/Logs/claudes/update.log`. That log also gets a line whenever an idle check could not run
+(for example `lsappinfo` failing); like the helper's log it is cut to its last 2000 lines once it passes 1 MB.
 
 ### App Management permission
 
@@ -150,9 +151,10 @@ An account counts as busy if any of these is true:
 Each account has its own clock: it has to stay idle for 10 minutes in a row
 (`CLAUDES_IDLE_MINUTES`) before it counts, and any busy sign restarts that clock.
 
-When every open account looks idle, `claudes` checks again for 2 minutes
-(`CLAUDES_CONFIRM_SECONDS`, every 15 seconds, `CLAUDES_CONFIRM_EVERY`). If anything was used in
-that time, nothing is quit and it goes back to waiting.
+When every open account looks idle, `claudes` checks again for about 2 minutes
+(`CLAUDES_CONFIRM_SECONDS`). All accounts are checked together, a new round every 15 seconds
+(`CLAUDES_CONFIRM_EVERY`), and the 2 minutes are real clock time. If anything was used in that time,
+nothing is quit, that account's 10-minute clock starts over, and it goes back to waiting.
 
 Other settings, all environment variables: `CLAUDES_POLL` (seconds between idle re-checks, 60),
 `CLAUDES_STOP_TIMEOUT` (30), `CLAUDES_INSTALL_TIMEOUT` (300), `CLAUDES_FEED_BASE` (Anthropic's
@@ -182,7 +184,8 @@ the update installs, it is reopened together with the others.
 - `ready` and `download/`: the verified download waiting to be installed.
 - `previous/`: the copy of the old Claude, kept until the update succeeds.
 - `previous-moved/`: the old app, when the install moved it aside.
-- `failed-new/`: the new Claude that failed to launch, after a roll back.
+- `failed-new/`: the new Claude that failed to launch. It is deleted after a successful roll back, so it only
+  stays when the old Claude could not be put back.
 - `idle-since`: when each account was first seen idle (the 10-minute clock).
 - `bin/claudes-windows`: the small full-screen checker, compiled on first use.
 - `reopen-pending`: the list of accounts closed for an update that still need reopening (an

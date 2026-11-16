@@ -80,7 +80,7 @@ stub_lsappinfo() { # reads the front pid from $T/front; no file = unknown
 #!/bin/bash
 [ -f "$T/front" ] || exit 1
 case "$1" in
-  front) echo "ASN:0x0-0x1234:";;
+  front) if [ -f "$T/front-out" ]; then cat "$T/front-out"; else echo "ASN:0x0-0x1234:"; fi;;
   info) [ "$2 $3" = "-only pid" ] && [ "$4" = "ASN:0x0-0x1234:" ] && printf '"pid"=%s\n' "$(cat "$T/front")";;
 esac
 EOS
@@ -332,17 +332,56 @@ DD() { echo "$CLAUDES_SUPPORT_DIR/Claude-3p"; }
   [ "$output" = 15530 ]
 }
 
-@test "front_app_pid: status 1 when lsappinfo knows nothing" {
+@test "front_app_pid: status 2 when lsappinfo fails" {
   rm -f "$T/front"
   run front_app_pid
-  [ "$status" -eq 1 ]
+  [ "$status" -eq 2 ]
   [ -z "$output" ]
 }
 
-@test "front_app_pid: status 1 when the pid is not a number" {
+@test "front_app_pid: status 2 when lsappinfo prints nothing at all" {
+  echo 1 > "$T/front"; : > "$T/front-out"
+  run front_app_pid
+  [ "$status" -eq 2 ]
+}
+
+@test "front_app_pid: status 1 when the pid is not a number (lsappinfo works, no front app)" {
   echo "[ NULL ]" > "$T/front"
   run front_app_pid
   [ "$status" -eq 1 ]
+}
+
+@test "front_app_pid: status 1 when lsappinfo works and says there is no front app" {
+  echo 1 > "$T/front"; echo "[ NULL ]" > "$T/front-out"
+  run front_app_pid
+  [ "$status" -eq 1 ]
+}
+
+@test "account_idle: lsappinfo working but reporting no front app is not busy and not logged" {
+  mkrunning
+  echo 1 > "$T/front"; echo "[ NULL ]" > "$T/front-out"
+  run account_idle "$(DD)"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  [ ! -e "$CLAUDES_LOG_DIR/update.log" ]
+}
+
+@test "account_idle: lsappinfo printing nothing is busy and logged" {
+  mkrunning
+  echo 1 > "$T/front"; : > "$T/front-out"
+  run account_idle "$(DD)"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"could not check which app is in front"* ]]
+  grep -q "could not check which app is in front" "$CLAUDES_LOG_DIR/update.log"
+}
+
+@test "_idle_log: update.log over 1 MB is cut to its last 2000 lines" {
+  mkdir -p "$CLAUDES_LOG_DIR"
+  eval "$(sed -n '/^_update_trim_log()/,/^}/p' "$REPO/lib/update.sh")"   # the real trimmer
+  awk 'BEGIN { for (i = 1; i <= 30000; i++) printf "line %d padded to make the file big enough for the limit\n", i }' > "$CLAUDES_LOG_DIR/update.log"
+  _idle_log "one more"
+  [ "$(wc -l < "$CLAUDES_LOG_DIR/update.log" | tr -d ' ')" = 2000 ]
+  [[ "$(tail -n 1 "$CLAUDES_LOG_DIR/update.log")" == *"idle check: one more" ]]
 }
 
 @test "fullscreen_pids prints what the helper prints" {

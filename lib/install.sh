@@ -94,12 +94,13 @@ install_via_shipit() {
     return 1
   fi
   offset="$(shipit_log_size)"
+  INSTALL_SHIPIT_SUBMITTED=1   # before submitting, so Ctrl-C during the submit still removes the job (removing one that never loaded is harmless)
   if ! launchctl submit -l "$_INSTALL_SHIPIT_LABEL" -e "$log" -- "$shipit" "$_INSTALL_SHIPIT_LABEL" "$state" >/dev/null 2>&1; then
     launchctl remove "$_INSTALL_SHIPIT_LABEL" >/dev/null 2>&1 || true
+    INSTALL_SHIPIT_SUBMITTED=0
     echo "Could not start Claude's own installer."
     return 1
   fi
-  INSTALL_SHIPIT_SUBMITTED=1
   start="$(_install_now)"
   while :; do
     text="$(shipit_log_since "$offset")"
@@ -239,7 +240,7 @@ install_finish() {
   case "$app" in
     "$CLAUDES_STATE_DIR"/download/*/app/Claude.app)
       dir="${app%/app/Claude.app}"
-      rm -rf "$dir";;
+      _rel_rm_rf "$dir" || true;;
   esac
   return 0
 }

@@ -195,12 +195,16 @@ claude_code_cpu_seconds() {
   echo $total | tr ' ' '\n' | awk '{ s += $1 } END { printf "%.2f\n", s + 0 }'
 }
 
-# -> pid of the frontmost app (lsappinfo front, then its pid); status 1 if unknown
+# -> pid of the frontmost app (lsappinfo front, then its pid). Status 0 with the pid; 1 when lsappinfo works but
+#    reports no front app (screen locked, another user switched in); 2 when lsappinfo itself fails.
 front_app_pid() {
-  local asn pid
-  asn="$(lsappinfo front 2>/dev/null | head -n 1 | tr -d '[:space:]')" || return 1
-  [ -n "$asn" ] || return 1
-  pid="$(lsappinfo info -only pid "$asn" 2>/dev/null | sed -n 's/.*=[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1)" || return 1
+  local out asn pid
+  out="$(lsappinfo front 2>/dev/null)" || return 2
+  asn="$(printf '%s\n' "$out" | head -n 1 | tr -d '[:space:]')"
+  [ -n "$asn" ] || return 2
+  case "$asn" in ASN:*) ;; *) return 1;; esac
+  out="$(lsappinfo info -only pid "$asn" 2>/dev/null)" || return 2
+  pid="$(printf '%s\n' "$out" | sed -n 's/.*=[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1)"
   case "$pid" in ''|*[!0-9]*) return 1;; esac
   printf '%s\n' "$pid"
 }
@@ -274,6 +278,7 @@ _recent_minutes() {
 _idle_log() {
   mkdir -p "$CLAUDES_LOG_DIR" 2>/dev/null || return 0
   printf '%s idle check: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$CLAUDES_LOG_DIR/update.log" 2>/dev/null || true
+  if declare -F _update_trim_log >/dev/null; then _update_trim_log "$CLAUDES_LOG_DIR/update.log"; fi
 }
 
 # DATADIR -> status 0 when idle; prints a short plain reason on stdout when busy; not running -> idle.
@@ -281,15 +286,18 @@ _idle_log() {
 # A rule that cannot run (lsappinfo or the full-screen helper failing) counts as busy and is logged, except in
 # a dry run (CLAUDES_IDLE_READONLY=1), where idle_rules_report says so instead.
 account_idle() {
-  local dir="$1" pid front fs newest c1 c2 delta reason
+  local dir="$1" pid front frc=0 fs newest c1 c2 delta reason
   pid="$(_idle_main_pid "$dir")"
   [ -n "$pid" ] || return 0
 
-  if front="$(front_app_pid)"; then
+  front="$(front_app_pid)" || frc=$?
+  if [ "$frc" = 0 ]; then
     if [ "$front" = "$pid" ]; then
       echo "its window is in front"
       return 1
     fi
+  elif [ "$frc" = 1 ]; then
+    :   # lsappinfo works but no app is in front, so no Claude window is
   elif [ "${CLAUDES_IDLE_READONLY:-0}" != 1 ]; then
     reason="could not check which app is in front (lsappinfo failed); the update waits until it works"
     _idle_log "$reason"
@@ -414,7 +422,7 @@ idle_rules_report() {
   echo "    - an export or import in progress"
   echo "    - a /loop or scheduled wake-up waiting inside a quiet session"
   echo "    - a claude.ai chat reply that is still streaming"
-  front_app_pid >/dev/null 2>&1 \
+  [ "$(front_app_pid >/dev/null 2>&1; echo $?)" != 2 ] \
     || echo "  Note: could not tell which app is in front on this Mac (lsappinfo failed). A real update counts every open account as busy until that works."
   fullscreen_pids >/dev/null 2>&1 \
     || echo "  Note: could not check for full-screen windows on this Mac (needs the Swift tools). A real update counts every open account as busy until you install Xcode Command Line Tools: xcode-select --install"

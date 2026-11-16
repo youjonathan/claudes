@@ -128,9 +128,9 @@ EOF
   printf '%s' "$out"
 }
 
-# -> keep the watcher log small: over 1 MB, keep its last 2000 lines (truncated in place, launchd keeps writing)
+# [FILE] -> keep the watcher log (or FILE) small: over 1 MB, keep its last 2000 lines (truncated in place, launchd keeps writing)
 _update_trim_log() {
-  local f="$CLAUDES_LOG_DIR/update-watcher.log" size tmp
+  local f="${1:-$CLAUDES_LOG_DIR/update-watcher.log}" size tmp
   [ -f "$f" ] || return 0
   size="$(wc -c < "$f" | tr -d ' ')"
   [ "$size" -gt 1048576 ] || return 0
@@ -370,32 +370,56 @@ _update_needs_terminal() {
   release_ready_set needs_terminal "$(claudes_now)" || true
 }
 
-# -> last look right before quitting: every account still idle at each check, every $CLAUDES_CONFIRM_EVERY seconds for
-#    $CLAUDES_CONFIRM_SECONDS seconds. Status 0 all quiet; 1 with "NAME is busy: reason" lines when anything was used.
+# -> last look right before quitting: every account still idle at each check. All accounts are checked at the same
+#    time (each check samples CPU for a while), a round starts every $CLAUDES_CONFIRM_EVERY seconds, and the whole look
+#    stops after $CLAUDES_CONFIRM_SECONDS seconds of the clock. A busy account starts its 10-minute countdown over.
+#    Status 0 all quiet; 1 with "NAME is busy: reason" lines when anything was used.
 _update_confirm_idle() {
-  local every="$CLAUDES_CONFIRM_EVERY" rounds d l n reason i=0 busy=""
+  local every="$CLAUDES_CONFIRM_EVERY" max d l n reason i tmp rc start now busy
   case "$every" in ''|*[!0-9]*|0) every=15;; esac
-  case "$CLAUDES_CONFIRM_SECONDS" in ''|*[!0-9]*) rounds=0;; *) rounds=$(( CLAUDES_CONFIRM_SECONDS / every ));; esac
+  case "$CLAUDES_CONFIRM_SECONDS" in ''|*[!0-9]*) max=0;; *) max=$(( CLAUDES_CONFIRM_SECONDS / every ));; esac
   [ -n "$UPDATE_ACCOUNTS" ] || return 0
-  [ "$rounds" -gt 0 ] || return 0
+  [ "$max" -gt 0 ] || return 0
   echo "Every account looks idle. Checking once more for $CLAUDES_CONFIRM_SECONDS seconds before quitting anything." >&2
-  while [ "$i" -lt "$rounds" ]; do
+  start="$(claudes_now)"
+  i=0
+  while [ "$i" -lt "$max" ]; do
     claudes_sleep "$every"
+    i=$((i + 1))
+    tmp="$(mktemp -d "${TMPDIR:-/tmp}/claudes-confirm.XXXXXX")"
+    n=0
     while IFS=$'\t' read -r d l; do
       [ -n "$d" ] || continue
-      if ! reason="$(account_idle "$d")"; then
-        n="$(update_account_name "$d" "$l")"
-        if [ -n "$reason" ]; then busy="$busy$n is busy: $reason"$'\n'; else busy="$busy$n is busy."$'\n'; fi
+      n=$((n + 1))
+      ( rc=0; reason="$(account_idle "$d")" || rc=$?
+        if [ "$rc" != 0 ] && [ "${CLAUDES_IDLE_READONLY:-0}" != 1 ]; then _idle_since_set "$d"; fi
+        echo "$rc" > "$tmp/$n.rc"; printf '%s' "$reason" > "$tmp/$n.reason" ) </dev/null &
+    done <<EOF
+$UPDATE_ACCOUNTS
+EOF
+    wait
+    busy=""
+    n=0
+    while IFS=$'\t' read -r d l; do
+      [ -n "$d" ] || continue
+      n=$((n + 1))
+      rc="$(cat "$tmp/$n.rc" 2>/dev/null || echo 1)"
+      if [ "$rc" != 0 ]; then
+        reason="$(cat "$tmp/$n.reason" 2>/dev/null || true)"
+        l="$(update_account_name "$d" "$l")"
+        if [ -n "$reason" ]; then busy="$busy$l is busy: $reason"$'\n'; else busy="$busy$l is busy."$'\n'; fi
       fi
     done <<EOF
 $UPDATE_ACCOUNTS
 EOF
+    rm -rf "$tmp"
     if [ -n "$busy" ]; then
       printf '%s' "$busy"
       echo "Something was used during the last check, so nothing was quit." >&2
       return 1
     fi
-    i=$((i + 1))
+    now="$(claudes_now)"
+    [ $(( now - start )) -lt "$CLAUDES_CONFIRM_SECONDS" ] || break
   done
   return 0
 }
@@ -484,7 +508,8 @@ _update_install_and_reopen() {
     _update_repair_app "$old_build" "$new_build" || true
     echo "Reopening your accounts on the old version."
     update_reopen_accounts || true
-    if [ "$UPDATE_WATCH" = 1 ]; then _update_needs_terminal; fi
+    # only a failed hand-over to macOS (1) with the download still good is worth asking for Terminal; 3 means the download itself went bad
+    if [ "$UPDATE_WATCH" = 1 ] && [ "$irc" = 1 ] && release_ready_app >/dev/null 2>&1; then _update_needs_terminal; fi
     return 1
   fi
   update_reopen_accounts || reopen_rc=1
@@ -607,7 +632,7 @@ _update_print_plan() {
   else
     echo "  1. Wait until every open account is idle (they all are right now)."
   fi
-  echo "  1b. Check again every $CLAUDES_CONFIRM_EVERY seconds for $CLAUDES_CONFIRM_SECONDS seconds; if anything is busy, go back to waiting (skipped in a dry run)."
+  echo "  1b. Check all accounts together every $CLAUDES_CONFIRM_EVERY seconds, for about $CLAUDES_CONFIRM_SECONDS seconds in all; if anything is busy, go back to waiting (skipped in a dry run)."
   echo "  2. Quit these together: $(update_names_of "$UPDATE_ACCOUNTS")"
   if [ "$kind" = release ]; then
     echo "  3. Hand the checked Claude to Claude's own installer (or move the app into place if that is not possible)."
