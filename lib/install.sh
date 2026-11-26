@@ -89,7 +89,8 @@ install_via_shipit() {
       && plutil -insert launchAfterInstallation -bool NO "$state" \
       && plutil -insert targetBundleURL -string "$(_install_file_url "$CLAUDES_APP_SRC")" "$state" \
       && plutil -insert updateBundleURL -string "$(_install_file_url "$new")" "$state" \
-      && plutil -insert useUpdateBundleName -bool YES "$state"; } 2>/dev/null; then
+      && plutil -insert useUpdateBundleName -bool YES "$state" \
+      && plutil -convert json "$state"; } 2>/dev/null; then   # ShipIt reads this file as JSON despite the .plist name
     echo "Could not write the installer's instruction file."
     return 1
   fi
@@ -98,6 +99,7 @@ install_via_shipit() {
   if ! launchctl submit -l "$_INSTALL_SHIPIT_LABEL" -e "$log" -- "$shipit" "$_INSTALL_SHIPIT_LABEL" "$state" >/dev/null 2>&1; then
     launchctl remove "$_INSTALL_SHIPIT_LABEL" >/dev/null 2>&1 || true
     INSTALL_SHIPIT_SUBMITTED=0
+    rm -f "$state"
     echo "Could not start Claude's own installer."
     return 1
   fi
@@ -122,6 +124,7 @@ install_via_shipit() {
   # submitted jobs restart themselves, so the job always goes
   launchctl remove "$_INSTALL_SHIPIT_LABEL" >/dev/null 2>&1 || true
   INSTALL_SHIPIT_SUBMITTED=0
+  rm -f "$state"   # claudes' own instruction file, used up either way; left behind it reads as an update waiting
   [ "$ok" = 1 ] && return 0
   echo "Claude's own installer did not finish the update:"
   printf '%s\n' "$reason"

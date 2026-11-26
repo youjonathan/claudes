@@ -43,7 +43,8 @@ SH
 echo "$*" >> "$T/launchctl.log"
 case "$1" in
   print) [ -f "$T/job_exists" ];;
-  submit) [ -f "$T/submit_fail" ] && exit 1; [ -f "$T/shipit_script" ] && bash "$T/shipit_script"; exit 0;;
+  submit) cp "${!#}" "$T/submitted_state" 2>/dev/null || true   # what ShipIt would have read
+          [ -f "$T/submit_fail" ] && exit 1; [ -f "$T/shipit_script" ] && bash "$T/shipit_script"; exit 0;;
   remove) exit 0;;
 esac
 SH
@@ -135,12 +136,45 @@ shipit_does() { # LOGLINE [swap]
   shipit_does "Installation completed successfully" swap
   run install_via_shipit "$T/sp ace/new/Claude.app"
   [ "$status" -eq 0 ]
-  p="$T/shipit/ShipItState.plist"
+  p="$T/submitted_state"
   [ "$(plutil -extract bundleIdentifier raw -o - "$p")" = com.anthropic.claudefordesktop ]
   [ "$(plutil -extract launchAfterInstallation raw -o - "$p")" = false ]
   [ "$(plutil -extract useUpdateBundleName raw -o - "$p")" = true ]
   [ "$(plutil -extract targetBundleURL raw -o - "$p")" = "file://$CLAUDES_APP_SRC/" ]
   [ "$(plutil -extract updateBundleURL raw -o - "$p")" = "file://${T}/sp%20ace/new/Claude.app/" ]
+}
+
+@test "install_via_shipit writes the state file as JSON, the format ShipIt reads" {
+  shipit_does "Installation completed successfully" swap
+  run install_via_shipit "$T/new/Claude.app"
+  [ "$status" -eq 0 ]
+  python3 -I -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["bundleIdentifier"] == "com.anthropic.claudefordesktop"
+assert d["launchAfterInstallation"] is False and d["useUpdateBundleName"] is True
+assert d["targetBundleURL"].startswith("file://") and d["updateBundleURL"].startswith("file://")
+' "$T/submitted_state"
+}
+
+@test "install_via_shipit removes its state file after success, failure, timeout and a failed submit" {
+  shipit_does "Installation completed successfully" swap
+  run install_via_shipit "$T/new/Claude.app"
+  [ "$status" -eq 0 ]
+  [ ! -e "$T/shipit/ShipItState.plist" ]
+  mkapp "$CLAUDES_APP_SRC" 100
+  shipit_does "Installation error: x"
+  run install_via_shipit "$T/new/Claude.app"
+  [ "$status" -eq 1 ]
+  [ ! -e "$T/shipit/ShipItState.plist" ]
+  : > "$T/shipit_script"
+  run install_via_shipit "$T/new/Claude.app"
+  [ "$status" -eq 1 ]
+  [ ! -e "$T/shipit/ShipItState.plist" ]
+  touch "$T/submit_fail"
+  run install_via_shipit "$T/new/Claude.app"
+  [ "$status" -eq 1 ]
+  [ ! -e "$T/shipit/ShipItState.plist" ]
 }
 
 @test "install_via_shipit submits the job with the right arguments" {
